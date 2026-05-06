@@ -212,6 +212,11 @@ class Instance {
     // Direction 2 (WASM→JS import arg): an i32 import arg that exists in the
     //   map is replaced with the stored JS object before calling the import fn.
     const _extMap = new Map()
+    const _registry = new FinalizationRegistry((idx) => {
+      _extMap.delete(idx)
+      // If we need to inform the native side, we could call binding.extvalFree(_instHandle, idx)
+    })
+    
     let _extNextIdx = wasmModule._wasm3ExternrefInfo.extrefInitSlots
     // Dedicated non-zero sentinel for undefined export args.  Not stored in _extMap
     // so _resolveExtref returns the integer, but wasm3's local.get bug corrupts it
@@ -285,22 +290,8 @@ class Instance {
           // into JS) invalidate the stale cached DataView/Uint8Array.
           if (_instHandle !== null) {
             const _mb = binding.getMemory(_instHandle)
-            if (n === 1) console.log('[wasm3] mem@import ' + k + ' byteLen=' + _mb.byteLength + ' detached=' + _mb.detached)
-            // wasm-bindgen's getDataViewMemory0 cache check uses THREE paths:
-            //   1. cachedDataViewMemory0 === null
-            //   2. buffer.detached === true  (needs js_detach_arraybuffer to work)
-            //   3. buffer.detached === undefined && buffer !== wasm.memory.buffer
-            // On JSC with ArrayBuffer.prototype.detached defined, path 3 is only
-            // evaluated when detached===undefined. If js_detach_arraybuffer sets
-            // detached=false (not true), both paths 2 and 3 fail. Fix: when we
-            // detect a buffer change, shadow .detached on the old buffer with an
-            // own property returning undefined, forcing path 3 to be evaluated.
-            if (_mb !== _prevMemBuf) {
-              if (_prevMemBuf !== null) {
-                try {
-                  Object.defineProperty(_prevMemBuf, 'detached', { get: function () { return undefined }, configurable: true })
-                } catch (e) { /* non-configurable on some runtimes */ }
-              }
+            if (_mb.byteLength !== _prevMemBuf?.byteLength) {
+              console.log('[wasm3] mem@import grow detected: ' + (_prevMemBuf ? _prevMemBuf.byteLength : 0) + ' -> ' + _mb.byteLength)
               _prevMemBuf = _mb
             }
           }
@@ -332,6 +323,7 @@ class Instance {
                 if (typeof qm === 'function') {
                   const idx = _extNextIdx++
                   _extMap.set(idx, qm)
+                  if (qm && (typeof qm === 'object' || typeof qm === 'function')) _registry.register(qm, idx)
                   return idx
                 }
                 return 0
@@ -372,6 +364,7 @@ class Instance {
                 : rawCb
               const wrappedIdx = _extNextIdx++
               _extMap.set(wrappedIdx, wrappedCb)
+              if (wrappedCb && (typeof wrappedCb === 'object' || typeof wrappedCb === 'function')) _registry.register(wrappedCb, wrappedIdx)
               // Replace last arg (the callback) with the wrapped version; keep any
               // leading args (e.g. the self object for the 2-param variant) intact.
               const actualResolvedArgs = [...resolvedArgs.slice(0, -1), wrappedCb]
@@ -379,11 +372,11 @@ class Instance {
               if (_extRefRetImportKeys.has(k)) {
                 if (ret === null || ret === undefined) return 0
                 if (typeof ret === 'number' && _extMap.has(ret)) return ret
-                const idx = _extNextIdx++; _extMap.set(idx, ret); return idx
+                const idx = _extNextIdx++; _extMap.set(idx, ret); if (ret && (typeof ret === 'object' || typeof ret === 'function')) _registry.register(ret, idx); return idx
               }
               if (typeof ret === 'boolean') return ret ? 1 : 0
               if (ret !== null && ret !== undefined && (typeof ret === 'object' || typeof ret === 'function' || typeof ret === 'symbol')) {
-                const idx = _extNextIdx++; _extMap.set(idx, ret); return idx
+                const idx = _extNextIdx++; _extMap.set(idx, ret); if (ret && (typeof ret === 'object' || typeof ret === 'function')) _registry.register(ret, idx); return idx
               }
               return ret
             }
@@ -427,7 +420,7 @@ class Instance {
               // If already an extMap slot index (e.g. returned by addToExternrefTable0),
               // return it directly — don't double-wrap.
               if (typeof ret === 'number' && _extMap.has(ret)) return ret
-              const idx = _extNextIdx++; _extMap.set(idx, ret); return idx
+              const idx = _extNextIdx++; _extMap.set(idx, ret); if (ret && (typeof ret === 'object' || typeof ret === 'function')) _registry.register(ret, idx); return idx
             }
             // wasm-bindgen JS functions return native booleans for i32 bool results
             // but wasm3's bridge calls js_get_value_int32() which fails on booleans.
@@ -441,6 +434,7 @@ class Instance {
                 (typeof ret === 'object' || typeof ret === 'function' || typeof ret === 'symbol')) {
               const idx = _extNextIdx++
               _extMap.set(idx, ret)
+              if (ret && (typeof ret === 'object' || typeof ret === 'function')) _registry.register(ret, idx)
               return idx
             }
             return ret
@@ -498,20 +492,18 @@ class Instance {
               if (a === undefined) return _extUndefinedSlot  // non-zero; wasm3 bug → 0 → _extMap[0]=undefined ✓
               const idx = _extNextIdx++
               _extMap.set(idx, a)
+              if (a && (typeof a === 'object' || typeof a === 'function')) _registry.register(a, idx)
               console.log('[wasm3] externref store: ' + exportName + ' arg → idx=' + idx + ' type=' + typeof a)
               return idx
             })
           }
 
-          // Proactively check for memory.grow (same pointer, larger size) so
-          // that wasm-bindgen's cachedUint8ArrayMemory0 gets invalidated before
-          // WASM runs.  getMemory detaches the old ArrayBuffer when size changed.
+          // Proactively check for memory.grow so that wasm-bindgen's cachedUint8ArrayMemory0
+          // gets invalidated before WASM runs.
           if (_instHandle !== null) {
             const _mb = binding.getMemory(_instHandle)
-            if (_mb !== _prevMemBuf) {
-              if (_prevMemBuf !== null) {
-                try { Object.defineProperty(_prevMemBuf, 'detached', { get: function () { return undefined }, configurable: true }) } catch (e) {}
-              }
+            if (_mb.byteLength !== _prevMemBuf?.byteLength) {
+              console.log('[wasm3] mem@export grow detected: ' + (_prevMemBuf ? _prevMemBuf.byteLength : 0) + ' -> ' + _mb.byteLength)
               _prevMemBuf = _mb
             }
           }
