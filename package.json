@@ -1,0 +1,30 @@
+{
+  "name": "bare-wasm3",
+  "version": "0.1.0",
+  "description": "WebAssembly polyfill for Bare using wasm3",
+  "addon": true,
+  "exports": {
+    ".": "./index.js",
+    "./global": "./global.js",
+    "./binding": "./binding.js"
+  },
+  "files": [
+    "src",
+    "binding.js",
+    "index.js",
+    "global.js",
+    "CMakeLists.txt",
+    "prebuilds"
+  ],
+  "scripts": {
+    "build": "bun run build:ios-arm64 && bun run build:ios-arm64-simulator && bun run link",
+    "build:ios-arm64": "bare-make generate --platform ios --arch arm64 --build build/ios-arm64 --define CMAKE_POLICY_VERSION_MINIMUM=3.5 && sh patch-wasm3.sh && bare-make build --build build/ios-arm64 && bare-make install --build build/ios-arm64",
+    "build:ios-arm64-simulator": "bare-make generate --platform ios --arch arm64 --simulator --build build/ios-arm64-simulator --define CMAKE_POLICY_VERSION_MINIMUM=3.5 && sh patch-wasm3.sh && bare-make build --build build/ios-arm64-simulator && bare-make install --build build/ios-arm64-simulator",
+    "link": "node ../../node_modules/react-native-bare-kit/ios/link.mjs"
+  },
+  "devDependencies": {
+    "bare-make": "^1.0.0",
+    "cmake-bare": "^1.1.6",
+    "cmake-fetch": "^1.0.0"
+  }
+}
