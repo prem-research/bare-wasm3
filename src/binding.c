@@ -671,10 +671,10 @@ bw3_instance_new (js_env_t *env, js_callback_info_t *info) {
     err = js_create_object(env, &entry);
     assert(err == 0);
     js_value_t *mod_str, *name_str;
-    err = js_create_string_utf8(env, meta->exports[i].import_module,
+    err = js_create_string_utf8(env, (const utf8_t *)meta->exports[i].import_module,
                                 strlen(meta->exports[i].import_module), &mod_str);
     assert(err == 0);
-    err = js_create_string_utf8(env, meta->exports[i].import_name,
+    err = js_create_string_utf8(env, (const utf8_t *)meta->exports[i].import_name,
                                 strlen(meta->exports[i].import_name), &name_str);
     assert(err == 0);
     err = js_set_named_property(env, entry, "module", mod_str);

@@ -1,0 +1,20 @@
+--- a/m3_parse.c
++++ b/m3_parse.c
+@@ -184,8 +184,15 @@
+             break;
+ 
+             case d_externalKind_table:
+-//                  result = ParseType_Table (& i_bytes, i_end);
+-                break;
++            {
++                /* skip table element type (reftype) + limits so parser stays in sync */
++                i8 refType; u8 flag; u32 limits;
++_               (ReadLEB_i7 (& refType, & i_bytes, i_end));
++_               (ReadLEB_u7 (& flag,    & i_bytes, i_end));
++_               (ReadLEB_u32(& limits,  & i_bytes, i_end));
++                if (flag & 1) { _  (ReadLEB_u32(& limits, & i_bytes, i_end)); }
++            }
++            break;
+ 
+             case d_externalKind_memory:
+             {

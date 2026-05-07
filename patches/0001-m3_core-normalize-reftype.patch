@@ -1,0 +1,11 @@
+--- a/m3_core.c
++++ b/m3_core.c
+@@ -203,6 +203,8 @@
+ 
+     if (type == 0x40)
+         type = c_m3Type_none;
++    else if (type == 16 || type == 17)  /* funcref/externref -- treat as i32 handle */
++        type = c_m3Type_i32;
+     else if (type < c_m3Type_i32 or type > c_m3Type_f64)
+         result = m3Err_invalidTypeId;
+ 

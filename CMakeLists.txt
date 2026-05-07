@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 4.0)
 
+set(CMAKE_POLICY_DEFAULT_CMP0169 OLD)
+
 find_package(cmake-bare REQUIRED PATHS node_modules/cmake-bare)
 find_package(cmake-fetch REQUIRED PATHS node_modules/cmake-fetch)
 

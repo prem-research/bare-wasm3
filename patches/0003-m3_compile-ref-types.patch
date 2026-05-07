@@ -1,0 +1,226 @@
+--- a/m3_compile.c
++++ b/m3_compile.c
+@@ -2073,6 +2073,96 @@
+ }
+ 
+ static
++/* Forward declarations for reference-types helpers */
++ M3Result Compile_Operator (IM3Compilation o, m3opcode_t i_opcode);
++M3Result        Compile_Select   (IM3Compilation o, m3opcode_t i_opcode);
++
++/* typed select (0x1C): read+discard type vector, behave as plain select */
++M3Result  Compile_SelectTyped  (IM3Compilation o, m3opcode_t i_opcode)
++{
++    M3Result result = m3Err_none;
++    u32 numTypes;
++_   (ReadLEB_u32 (& numTypes, & o->wasm, o->wasmEnd));
++    for (u32 i = 0; i < numTypes; i++) {
++        i8 t;
++_       (ReadLEB_i7 (& t, & o->wasm, o->wasmEnd));
++    }
++    return Compile_Select (o, 0x1b);
++_catch: return result;
++}
++
++/* ref.null / ref.is_null / ref.func — push opaque i32 zero; good enough for load */
++M3Result  Compile_RefNull  (IM3Compilation o, m3opcode_t i_opcode)
++{
++    M3Result result = m3Err_none;
++    i8 reftype;
++_   (ReadLEB_i7 (& reftype, & o->wasm, o->wasmEnd));
++    (void)reftype;
++_   (PushConst (o, 0, c_m3Type_i32));
++_catch: return result;
++}
++
++M3Result  Compile_RefIsNull  (IM3Compilation o, m3opcode_t i_opcode)
++{
++    return Compile_Operator (o, 0x45);  /* reuse i32.eqz */
++}
++
++M3Result  Compile_RefFunc  (IM3Compilation o, m3opcode_t i_opcode)
++{
++    M3Result result = m3Err_none;
++    u32 funcIdx;
++_   (ReadLEB_u32 (& funcIdx, & o->wasm, o->wasmEnd));
++    (void)funcIdx;
++_   (PushConst (o, 0, c_m3Type_i32));
++_catch: return result;
++}
++
++/* table.get $t (0x25): for externref table (t==1) look up ext_vals; otherwise identity */
++M3Result  Compile_TableGet  (IM3Compilation o, m3opcode_t i_opcode)
++{
++    M3Result result = m3Err_none;
++    u32 tableIdx;
++_   (ReadLEB_u32 (& tableIdx, & o->wasm, o->wasmEnd));
++    if (tableIdx == 1) {
++        bw3_ext_ctx_ops_t *ctx = (bw3_ext_ctx_ops_t *)o->runtime->userdata;
++        bool inReg   = IsStackTopInRegister (o);
++        u16  idxSlot = inReg ? 0 : GetStackTopSlotNumber (o);
++_       (Pop (o));
++        IM3Operation op = inReg ? op_ExtTableGet_r : op_ExtTableGet_s;
++_       (EmitOp (o, op));
++        EmitPointer (o, ctx);
++        if (!inReg) EmitSlotOffset (o, (i32)idxSlot);
++_       (PushAllocatedSlotAndEmit (o, c_m3Type_i32));
++    }
++_catch: return result;
++}
++
++/* table.set $t (0x26): for externref table (t==1) store to ext_vals; otherwise discard */
++M3Result  Compile_TableSet  (IM3Compilation o, m3opcode_t i_opcode)
++{
++    M3Result result = m3Err_none;
++    u32 tableIdx;
++_   (ReadLEB_u32 (& tableIdx, & o->wasm, o->wasmEnd));
++    if (tableIdx == 1) {
++        bw3_ext_ctx_ops_t *ctx = (bw3_ext_ctx_ops_t *)o->runtime->userdata;
++        /* Stack: [idx, ref]  ref is TOS */
++        bool refInReg = IsStackTopInRegister (o);
++        u16  refSlot  = refInReg ? 0 : GetStackTopSlotNumber (o);
++_       (Pop (o));  /* pop ref */
++        u16  idxSlot  = GetStackTopSlotNumber (o);
++_       (Pop (o));  /* pop idx */
++        IM3Operation op = refInReg ? op_ExtTableSet_rs : op_ExtTableSet_ss;
++_       (EmitOp (o, op));
++        EmitPointer (o, ctx);
++        EmitSlotOffset (o, (i32)idxSlot);
++        if (!refInReg) EmitSlotOffset (o, (i32)refSlot);
++    } else {
++_       (Pop (o));
++_       (Pop (o));
++    }
++_catch: return result;
++}
++
+ M3Result  Compile_Unreachable  (IM3Compilation o, m3opcode_t i_opcode)
+ {
+     M3Result result;
+@@ -2292,7 +2382,9 @@
+     M3OP( "global.get",         1,  none,   d_emptyOpList,                      Compile_GetSetGlobal ), // 0x23
+     M3OP( "global.set",         1,  none,   d_emptyOpList,                      Compile_GetSetGlobal ), // 0x24
+ 
+-    M3OP_RESERVED,  M3OP_RESERVED, M3OP_RESERVED,                                                       // 0x25...0x27
++    M3OP( "table.get", 0, i_32,   d_emptyOpList, Compile_TableGet ),  // 0x25
++    M3OP( "table.set",-2, none,  d_emptyOpList, Compile_TableSet ),  // 0x26
++    M3OP_RESERVED,                                                     // 0x27
+ 
+     M3OP( "i32.load",           0,  i_32,   d_unaryOpList (i32, Load_i32),      Compile_Load_Store ),   // 0x28
+     M3OP( "i64.load",           0,  i_64,   d_unaryOpList (i64, Load_i64),      Compile_Load_Store ),   // 0x29
+@@ -2480,6 +2572,11 @@
+     M3OP( "i64.extend16_s",      0,  i_64,   d_unaryOpList (i64, Extend16_s),       NULL    ),          // 0xc3
+     M3OP( "i64.extend32_s",      0,  i_64,   d_unaryOpList (i64, Extend32_s),       NULL    ),          // 0xc4
+ 
++    /* reference types proposal */
++    [0xd0] = M3OP( "ref.null",    1, i_32,   d_emptyOpList,  Compile_RefNull   ),  // 0xd0
++    [0xd1] = M3OP( "ref.is_null", 0, i_32,   d_emptyOpList,  Compile_RefIsNull ),  // 0xd1
++    [0xd2] = M3OP( "ref.func",    1, i_32,   d_emptyOpList,  Compile_RefFunc   ),  // 0xd2
++
+ # ifdef DEBUG // for codepage logging. the order doesn't matter:
+ #   define d_m3DebugOp(OP) M3OP (#OP, 0, none, { op_##OP })
+ 
+@@ -2523,6 +2620,88 @@
+     M3OP( "termination", 0, c_m3Type_unknown ) // for find_operation_info
+ # endif
+ };
++
++/* FC-prefix table ops (0x0C-0x11) — reference types proposal stubs */
++M3Result  Compile_FCTableInit  (IM3Compilation o, m3opcode_t i_opcode)
++{
++    M3Result result = m3Err_none;
++    u32 elemIdx, tableIdx;
++_   (ReadLEB_u32 (& elemIdx,  & o->wasm, o->wasmEnd));
++_   (ReadLEB_u32 (& tableIdx, & o->wasm, o->wasmEnd));
++    (void)elemIdx; (void)tableIdx;
++_   (Pop (o)); _   (Pop (o)); _   (Pop (o));
++_catch: return result;
++}
++
++M3Result  Compile_FCElemDrop  (IM3Compilation o, m3opcode_t i_opcode)
++{
++    M3Result result = m3Err_none;
++    u32 elemIdx;
++_   (ReadLEB_u32 (& elemIdx, & o->wasm, o->wasmEnd));
++    (void)elemIdx;
++_catch: return result;
++}
++
++M3Result  Compile_FCTableCopy  (IM3Compilation o, m3opcode_t i_opcode)
++{
++    M3Result result = m3Err_none;
++    u32 dstIdx, srcIdx;
++_   (ReadLEB_u32 (& dstIdx, & o->wasm, o->wasmEnd));
++_   (ReadLEB_u32 (& srcIdx, & o->wasm, o->wasmEnd));
++    (void)dstIdx; (void)srcIdx;
++_   (Pop (o)); _   (Pop (o)); _   (Pop (o));
++_catch: return result;
++}
++
++M3Result  Compile_FCTableGrow  (IM3Compilation o, m3opcode_t i_opcode)
++{
++    M3Result result = m3Err_none;
++    u32 tableIdx;
++_   (ReadLEB_u32 (& tableIdx, & o->wasm, o->wasmEnd));
++    if (tableIdx == 1) {
++        bw3_ext_ctx_ops_t *ctx = (bw3_ext_ctx_ops_t *)o->runtime->userdata;
++        /* Stack: [init_val, n]  n is TOS */
++        bool nInReg = IsStackTopInRegister (o);
++        u16  nSlot  = nInReg ? 0 : GetStackTopSlotNumber (o);
++_       (Pop (o));  /* pop n */
++_       (Pop (o));  /* pop init_val (discard) */
++        IM3Operation op = nInReg ? op_ExtTableGrow_r : op_ExtTableGrow_s;
++_       (EmitOp (o, op));
++        EmitPointer (o, ctx);
++        if (!nInReg) EmitSlotOffset (o, (i32)nSlot);
++_       (PushAllocatedSlotAndEmit (o, c_m3Type_i32));
++    } else {
++_       (Pop (o)); _   (Pop (o));
++_       (PushConst (o, (u64)(u32)(-1), c_m3Type_i32));
++    }
++_catch: return result;
++}
++
++M3Result  Compile_FCTableSize  (IM3Compilation o, m3opcode_t i_opcode)
++{
++    M3Result result = m3Err_none;
++    u32 tableIdx;
++_   (ReadLEB_u32 (& tableIdx, & o->wasm, o->wasmEnd));
++    if (tableIdx == 1) {
++        bw3_ext_ctx_ops_t *ctx = (bw3_ext_ctx_ops_t *)o->runtime->userdata;
++_       (EmitOp (o, op_ExtTableSize));
++        EmitPointer (o, ctx);
++_       (PushAllocatedSlotAndEmit (o, c_m3Type_i32));
++    } else {
++_       (PushConst (o, 0, c_m3Type_i32));
++    }
++_catch: return result;
++}
++
++M3Result  Compile_FCTableFill  (IM3Compilation o, m3opcode_t i_opcode)
++{
++    M3Result result = m3Err_none;
++    u32 tableIdx;
++_   (ReadLEB_u32 (& tableIdx, & o->wasm, o->wasmEnd));
++    (void)tableIdx;
++_   (Pop (o)); _   (Pop (o)); _   (Pop (o));
++_catch: return result;
++}
+ 
+ const M3OpInfo c_operationsFC [] =
+ {
+@@ -2539,6 +2718,14 @@
+ 
+     M3OP( "memory.copy",            0,  none,   d_emptyOpList,                           Compile_Memory_CopyFill ), // 0x0a
+     M3OP( "memory.fill",            0,  none,   d_emptyOpList,                           Compile_Memory_CopyFill ), // 0x0b
++
++    /* reference types table operations */
++    M3OP_F( "table.init",           0,  none,   d_emptyOpList,  Compile_FCTableInit  ),  // 0x0c
++    M3OP_F( "elem.drop",            0,  none,   d_emptyOpList,  Compile_FCElemDrop   ),  // 0x0d
++    M3OP_F( "table.copy",           0,  none,   d_emptyOpList,  Compile_FCTableCopy  ),  // 0x0e
++    M3OP_F( "table.grow",           0,  i_32,   d_emptyOpList,  Compile_FCTableGrow  ),  // 0x0f
++    M3OP_F( "table.size",           0,  i_32,   d_emptyOpList,  Compile_FCTableSize  ),  // 0x10
++    M3OP_F( "table.fill",           0,  none,   d_emptyOpList,  Compile_FCTableFill  ),  // 0x11
+ 
+ 
+ # ifdef DEBUG
