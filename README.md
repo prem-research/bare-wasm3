@@ -1,4 +1,6 @@
-# bare-wasm3
+<img src="/.github/assets/bare-wasm3-logo.svg" width="400px" align="right"></img>
+
+### bare-wasm3
 
 A [Bare](https://github.com/holepunchto/bare) addon that ships a `WebAssembly`
 implementation backed by [wasm3](https://github.com/wasm3/wasm3), patched to be `wasm-bindgen` compatible.
