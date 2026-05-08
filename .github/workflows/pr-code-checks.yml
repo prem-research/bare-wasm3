@@ -1,0 +1,23 @@
+name: PR Code Checks
+on: [pull_request]
+
+jobs:
+  main:
+    runs-on: macos-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+        name: checkout code
+      - uses: oven-sh/setup-bun@v2
+        name: setup bun
+      - name: install quilt
+        run: brew install quilt
+      - name: install deps
+        run: bun install
+      - name: check bun lockfile
+        run: git diff --exit-code HEAD -- bun.lock || exit 1
+      - name: build
+        run: bun run build

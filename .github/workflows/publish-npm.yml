@@ -1,0 +1,50 @@
+name: "Publish NPM"
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  main:
+    runs-on: macos-latest
+
+    permissions:
+      contents: read
+
+    if: ${{ github.event.head_commit != null && !endsWith(github.event.head_commit.message, '[skip-ci]') }}
+
+    steps:
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.GHA_CICD_APPID }}
+          private-key: ${{ secrets.GHA_CICD_PKEY }}
+      - uses: actions/checkout@v4
+        name: checkout code
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+      - name: git config
+        run: |
+          #!/bin/sh -e
+
+          git config user.name "${{ steps.app-token.outputs.app-slug }}"
+          git config user.email "${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com"
+      - uses: oven-sh/setup-bun@v2
+        name: setup bun
+      - name: install quilt
+        run: brew install quilt
+      - name: install deps
+        run: bun install
+      - name: build
+        run: bun run build
+      - name: release-it
+        run: bunx release-it --ci
+      - name: fix package.json
+        run: mv package.json package.json.tmpl
+      - name: publish npm package (npmjs)
+        run: |
+          #!/bin/sh -e
+
+          jq --arg name "@premai/`jq -r '.name' package.json.tmpl`" '.name = $name' package.json.tmpl > package.json
+
+          bun publish --access public
