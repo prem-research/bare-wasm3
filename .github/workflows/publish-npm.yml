@@ -42,12 +42,5 @@ jobs:
         run: bun run build
       - name: release-it
         run: PATH="`pwd`/bin:${PATH}" bunx release-it --ci
-      - name: fix package.json
-        run: mv package.json package.json.tmpl
       - name: publish npm package (npmjs)
-        run: |
-          #!/bin/sh -e
-
-          jq --arg name "@premai/`jq -r '.name' package.json.tmpl`" '.name = $name' package.json.tmpl > package.json
-
-          npm publish --access=public
+        run: npm publish --access=public
