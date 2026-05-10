@@ -20,9 +20,11 @@
     "prebuilds"
   ],
   "scripts": {
+    "clean": "rm -rf prebuilds build",
     "build": "bun run build:ios-arm64 && bun run build:ios-arm64-simulator",
     "build:ios-arm64": "bare-make generate --platform ios --arch arm64 --build build/ios-arm64 --define CMAKE_POLICY_VERSION_MINIMUM=3.5 && sh patch-wasm3.sh && bare-make build --build build/ios-arm64 && bare-make install --build build/ios-arm64",
     "build:ios-arm64-simulator": "bare-make generate --platform ios --arch arm64 --simulator --build build/ios-arm64-simulator --define CMAKE_POLICY_VERSION_MINIMUM=3.5 && sh patch-wasm3.sh && bare-make build --build build/ios-arm64-simulator && bare-make install --build build/ios-arm64-simulator",
+    "dev:build": "bare-make generate --platform ios --arch arm64 --build build/ios-arm64 --define CMAKE_POLICY_VERSION_MINIMUM=3.5 --define CMAKE_C_FLAGS=-DBW3_DBG_ENABLED=1 && sh patch-wasm3.sh && bare-make build --build build/ios-arm64 && bare-make install --build build/ios-arm64",
     "dev:link": "bun node_modules/react-native-bare-kit/ios/link.mjs"
   },
   "devDependencies": {

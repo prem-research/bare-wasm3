@@ -1,9 +1,9 @@
 --- a/m3_exec.h
 +++ b/m3_exec.h
-@@ -1522,6 +1522,82 @@
+@@ -1522,6 +1522,85 @@
  }
  # endif
- 
+
 +/* ── bw3 externref table ops ────────────────────────────────────────────────
 + * Layout must match bw3_ext_ctx_t in binding.c.
 + * Immediates layout:
@@ -15,14 +15,18 @@
 + *   ExtTableSet_rs  : [ctx*] [idx_slot]          (ref = _r0)
 + *   ExtTableSet_ss  : [ctx*] [idx_slot] [ref_slot]
 + */
-+typedef struct { uint32_t ext_size; uint32_t ext_cap; uint32_t *ext_vals; } bw3_ext_ctx_ops_t;
++typedef struct {
++  uint32_t  ext_size;
++  uint32_t  ext_cap;
++  uint32_t *ext_vals;
++  uint32_t (*grow_fn)(void *ctx, uint32_t n);
++} bw3_ext_ctx_ops_t;
 +
 +d_m3Op(ExtTableGrow_r)
 +{
 +    bw3_ext_ctx_ops_t *ctx = immediate(bw3_ext_ctx_ops_t *);
 +    uint32_t n   = (uint32_t)_r0;
-+    uint32_t old = ctx->ext_size;
-+    uint32_t res = (old + n <= ctx->ext_cap) ? (ctx->ext_size = old + n, old) : (uint32_t)(-1);
++    uint32_t res = ctx->grow_fn(ctx, n);
 +    slot(uint32_t) = res;
 +    nextOp();
 +}
@@ -31,8 +35,7 @@
 +{
 +    bw3_ext_ctx_ops_t *ctx = immediate(bw3_ext_ctx_ops_t *);
 +    uint32_t n   = slot(uint32_t);
-+    uint32_t old = ctx->ext_size;
-+    uint32_t res = (old + n <= ctx->ext_cap) ? (ctx->ext_size = old + n, old) : (uint32_t)(-1);
++    uint32_t res = ctx->grow_fn(ctx, n);
 +    slot(uint32_t) = res;
 +    nextOp();
 +}
@@ -81,5 +84,5 @@
 +}
 +
  d_m3EndExternC
- 
+
  #endif // m3_exec_h
