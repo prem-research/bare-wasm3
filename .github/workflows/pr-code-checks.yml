@@ -14,10 +14,12 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         name: setup bun
       - name: install quilt
-        run: brew install quilt
+        run: brew install quilt@0.69
+      - name: install android ndk
+        run: brew install android-ndk@29
       - name: install deps
         run: bun install
       - name: check bun lockfile
         run: git diff --exit-code HEAD -- bun.lock || exit 1
       - name: build
-        run: bun run build
+        run: ANDROID_NDK_HOME="$HOMEBREW_PREFIX/share/android-ndk" bun run build
