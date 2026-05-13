@@ -35,13 +35,16 @@ jobs:
       - name: setup npm
         run: npm i -g npm@^11.14
       - name: install quilt
-        run: brew install quilt@0.69
-      - name: install android ndk
-        run: brew install android-ndk@29
+        run: brew install quilt
+      - uses: nttld/setup-ndk@v1.6.0
+        id: setup-ndk
+        with:
+          ndk-version: r29
+          add-to-path: false
       - name: install deps
         run: bun install
       - name: build
-        run: ANDROID_NDK_HOME="$HOMEBREW_PREFIX/share/android-ndk" bun run build
+        run: ANDROID_NDK_HOME="${{ steps.setup-ndk.outputs.ndk-path }}" bun run build
       - name: release-it
         run: PATH="`pwd`/bin:${PATH}" bunx release-it --ci
       - name: publish npm package (npmjs)
