@@ -21,10 +21,15 @@
   ],
   "scripts": {
     "clean": "rm -rf prebuilds build",
-    "build": "bun run build:ios-arm64 && bun run build:ios-arm64-simulator",
+    "build": "bun run build:ios-arm64 && bun run build:android && bun run mobile:copy-prebuilds",
     "build:ios-arm64": "bare-make generate --platform ios --arch arm64 --build build/ios-arm64 --define CMAKE_POLICY_VERSION_MINIMUM=3.5 && sh patch-wasm3.sh && bare-make build --build build/ios-arm64 && bare-make install --build build/ios-arm64",
     "build:ios-arm64-simulator": "bare-make generate --platform ios --arch arm64 --simulator --build build/ios-arm64-simulator --define CMAKE_POLICY_VERSION_MINIMUM=3.5 && sh patch-wasm3.sh && bare-make build --build build/ios-arm64-simulator && bare-make install --build build/ios-arm64-simulator",
-    "dev:build": "bare-make generate --platform ios --arch arm64 --build build/ios-arm64 --define CMAKE_POLICY_VERSION_MINIMUM=3.5 --define CMAKE_C_FLAGS=-DBW3_DBG_ENABLED=1 && sh patch-wasm3.sh && bare-make build --build build/ios-arm64 && bare-make install --build build/ios-arm64",
+    "build:android": "bun run build:android-arm64",
+    "build:android-arm64": "bare-make generate --define CMAKE_POLICY_VERSION_MINIMUM=3.5 --platform android --arch arm64 --build build/android-arm64 && sh patch-wasm3.sh && bare-make build --build build/android-arm64 && bare-make install --build build/android-arm64",
+    "mobile:copy-prebuilds": "cp -r prebuilds/android-arm64 prebuilds/android-arm || echo 'android-arm prebuilds already present' && cp -r prebuilds/android-arm64 prebuilds/android-ia32 || echo 'android-ia32 prebuilds already present' && cp -r prebuilds/android-arm64 prebuilds/android-x64 || echo 'android-x64 prebuilds already present' && cp -r prebuilds/ios-arm64 prebuilds/ios-arm64-simulator || echo 'ios-arm64-simulator prebuilds already present' && cp -r prebuilds/ios-arm64 prebuilds/ios-x64-simulator || echo 'ios-x64-simulator prebuilds already present'",
+    "dev:build": "bun run dev:build:ios-arm64 && bun run dev:build:android-arm64 && bun run mobile:copy-prebuilds",
+    "dev:build:ios-arm64": "bare-make generate --platform ios --arch arm64 --build build/ios-arm64 --define CMAKE_POLICY_VERSION_MINIMUM=3.5 --define CMAKE_C_FLAGS=-DBW3_DBG_ENABLED=1 && sh patch-wasm3.sh && bare-make build --build build/ios-arm64 && bare-make install --build build/ios-arm64",
+    "dev:build:android-arm64": "bare-make generate --define CMAKE_POLICY_VERSION_MINIMUM=3.5 --define CMAKE_C_FLAGS=-DBW3_DBG_ENABLED=1 --platform android --arch arm64 --build build/android-arm64 && sh patch-wasm3.sh && bare-make build --build build/android-arm64 && bare-make install --build build/android-arm64",
     "dev:link": "bun node_modules/react-native-bare-kit/ios/link.mjs"
   },
   "devDependencies": {
