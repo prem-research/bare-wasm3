@@ -1,6 +1,6 @@
 {
   "name": "@premai/bare-wasm3",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "WebAssembly polyfill for Bare using wasm3, wasm-bindgen compatible",
   "license": "MIT",
   "repository": {
