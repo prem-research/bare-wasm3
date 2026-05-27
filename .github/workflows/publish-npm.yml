@@ -36,6 +36,8 @@ jobs:
         run: npm i -g npm@^11.14
       - name: install quilt
         run: brew install quilt
+      - name: install zig
+        run: brew install zig
       - uses: nttld/setup-ndk@v1.6.0
         id: setup-ndk
         with:
