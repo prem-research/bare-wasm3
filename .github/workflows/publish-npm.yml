@@ -20,7 +20,7 @@ jobs:
         with:
           app-id: ${{ secrets.GHA_CICD_APPID }}
           private-key: ${{ secrets.GHA_CICD_PKEY }}
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         name: checkout code
         with:
           token: ${{ steps.app-token.outputs.token }}

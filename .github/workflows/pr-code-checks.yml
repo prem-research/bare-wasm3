@@ -9,7 +9,7 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         name: checkout code
       - uses: oven-sh/setup-bun@v2
         name: setup bun
