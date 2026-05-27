@@ -9,12 +9,14 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         name: checkout code
       - uses: oven-sh/setup-bun@v2
         name: setup bun
       - name: install quilt
         run: brew install quilt
+      - name: install zig
+        run: brew install zig
       - uses: nttld/setup-ndk@v1.6.0
         id: setup-ndk
         with:

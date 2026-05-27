@@ -7,7 +7,8 @@ set -e
 
 BASE="$(cd "$(dirname "$0")" && pwd)"
 
-for build_dir in "build/ios-arm64" "build/ios-arm64-simulator" "build/android-arm64"; do
+for build_dir in build/*/; do
+  build_dir="${build_dir%/}"
   src="$BASE/$build_dir/_deps/github+wasm3+wasm3-src/source"
   if [ ! -d "$src" ]; then
     echo "  [patch] skipping $build_dir (not yet generated)"

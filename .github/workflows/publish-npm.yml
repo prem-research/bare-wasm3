@@ -20,7 +20,7 @@ jobs:
         with:
           app-id: ${{ secrets.GHA_CICD_APPID }}
           private-key: ${{ secrets.GHA_CICD_PKEY }}
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         name: checkout code
         with:
           token: ${{ steps.app-token.outputs.token }}
@@ -36,6 +36,8 @@ jobs:
         run: npm i -g npm@^11.14
       - name: install quilt
         run: brew install quilt
+      - name: install zig
+        run: brew install zig
       - uses: nttld/setup-ndk@v1.6.0
         id: setup-ndk
         with:

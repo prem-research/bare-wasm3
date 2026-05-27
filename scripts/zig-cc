@@ -1,0 +1,28 @@
+#!/bin/bash
+# zig cc cross-compiler wrapper. Set ZIG_TARGET before invoking cmake.
+# - Strips --target=... (CMake injects the toolchain target; ZIG_TARGET overrides it)
+# - Filters -Xlinker --dependency-file=... which zig's lld doesn't support.
+args=()
+i=0
+argv=("$@")
+while [ $i -lt ${#argv[@]} ]; do
+  arg="${argv[$i]}"
+  case "$arg" in
+    --target=*)
+      i=$((i+1))
+      continue
+      ;;
+  esac
+  if [ "$arg" = "-Xlinker" ] && [ $((i+1)) -lt ${#argv[@]} ]; then
+    next="${argv[$((i+1))]}"
+    case "$next" in
+      --dependency-file=*)
+        i=$((i+2))
+        continue
+        ;;
+    esac
+  fi
+  args+=("$arg")
+  i=$((i+1))
+done
+exec zig cc -target "$ZIG_TARGET" "${args[@]}"
