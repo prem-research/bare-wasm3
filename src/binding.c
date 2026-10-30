@@ -28,6 +28,13 @@
 #define BW3_MAX_FN_ARGS    16
 #define BW3_STACK_SIZE    (512 * 1024)
 #define BW3_HANDLE_INVALID 0xFFFFFFFF
+/* wasm-bindgen 0.2.121+ closure shim export name marker. */
+#define BW3_CLOSURE_EXPORT_PREFIX "___convert__closures_____invoke___"
+/* Closure shim export names exceed 300 chars. */
+#define BW3_EXPORT_NAME_MAX 512
+#define BW3_IMPORT_MODULE_MAX 128
+/* Multi-value: callExport can return at most this many results */
+#define BW3_MAX_RET_VALS   BW3_MAX_FN_ARGS
 
 /* Magic constants for handle validation — prevents raw-pointer forgery  */
 #define BW3_MODULE_MAGIC   0xB7000001
@@ -167,9 +174,14 @@ vt_sig (uint8_t vt) {
 
 /* ─── WASM binary metadata ────────────────────────────────────────────────── */
 
+/* Patched wasm3 uses table 1 as the externref table. */
+#define BW3_EXT_TABLE_IDX      1
+/* Max declared initial size allocated up front. */
+#define BW3_EXT_TABLE_MAX_INIT (1u << 20)
+
 typedef struct {
-  char    module[64];
-  char    name[128];
+  char    module[BW3_IMPORT_MODULE_MAX];
+  char    name[BW3_EXPORT_NAME_MAX];
   char    sig[32];          /* wasm3 signature, e.g. "v(ii)" */
   int     num_params;
   int     num_results;
@@ -178,12 +190,15 @@ typedef struct {
 } bw3_import_desc_t;
 
 typedef struct {
-  char    name[128];
+  char    name[BW3_EXPORT_NAME_MAX];
   uint8_t kind;             /* 0=func, 1=table, 2=memory, 3=global */
   bool    is_import_reexport;
-  char    import_module[64];
-  char    import_name[128];
+  char    import_module[BW3_IMPORT_MODULE_MAX];
+  char    import_name[BW3_EXPORT_NAME_MAX];
   bool    is_externref_return; /* true if the function's first result is externref */
+  int     first_result;        /* wasm3 type code of the first result, -1 if none */
+  bool    is_closure_shim;     /* true for wasm-bindgen closure invoke shims */
+  bool    is_multi_return;     /* true if the function has more than one result */
 } bw3_export_desc_t;
 
 typedef struct {
@@ -199,7 +214,7 @@ typedef struct {
   int                import_count;
   bw3_export_desc_t *exports;   /* heap-allocated; length = export_count */
   int                export_count;
-  int                extref_init_slots;  /* max slot index + 1 used by __wbindgen_init_externref_table */
+  uint32_t           ext_table_min;      /* declared initial size of the externref table */
 } bw3_wasm_meta_t;
 
 static void
@@ -215,6 +230,7 @@ parse_wasm_meta (js_env_t *env, const uint8_t *wasm, size_t len, bw3_wasm_meta_t
    * functions don't overflow the cap and miss externref-return exports. */
   int *func_types = NULL;
   int  func_type_count = 0;
+  int  rc = 0;   /* -2: a name exceeds its fixed buffer (would be truncated) */
 
   memset(out, 0, sizeof(*out));
   if (len < 8 || memcmp(wasm, "\0asm", 4) != 0) return -1;
@@ -225,8 +241,8 @@ parse_wasm_meta (js_env_t *env, const uint8_t *wasm, size_t len, bw3_wasm_meta_t
 
   /* locate sections */
   const uint8_t *type_sec = NULL, *import_sec = NULL, *func_sec = NULL, *export_sec = NULL;
-  const uint8_t *code_sec = NULL;
-  size_t type_sz = 0, import_sz = 0, func_sz = 0, export_sz = 0, code_sz = 0;
+  const uint8_t *code_sec = NULL, *table_sec = NULL;
+  size_t type_sz = 0, import_sz = 0, func_sz = 0, export_sz = 0, code_sz = 0, table_sz = 0;
 
   while (p < end) {
     uint8_t id = *p++;
@@ -235,6 +251,7 @@ parse_wasm_meta (js_env_t *env, const uint8_t *wasm, size_t len, bw3_wasm_meta_t
     if (id == 1)  { type_sec = p;   type_sz = sz; }
     if (id == 2)  { import_sec = p; import_sz = sz; }
     if (id == 3)  { func_sec  = p;  func_sz  = sz; }
+    if (id == 4)  { table_sec = p;  table_sz = sz; }
     if (id == 7)  { export_sec = p; export_sz = sz; }
     if (id == 10) { code_sec = p;   code_sz  = sz; }
     p += sz;
@@ -267,6 +284,7 @@ parse_wasm_meta (js_env_t *env, const uint8_t *wasm, size_t len, bw3_wasm_meta_t
   }
 
   /* parse import section */
+  uint32_t imported_tables = 0;
   if (import_sec) {
     const uint8_t *ip = import_sec, *ie = import_sec + import_sz;
     int ic = (int)leb_u32(&ip, ie);
@@ -279,17 +297,21 @@ parse_wasm_meta (js_env_t *env, const uint8_t *wasm, size_t len, bw3_wasm_meta_t
       /* module name */
       uint32_t mlen = leb_u32(&ip, ie);
       if (mlen > (uint32_t)(ie - ip)) break; /* truncated binary */
-      int mcap = mlen < 63 ? (int)mlen : 63;
+      if (mlen > BW3_IMPORT_MODULE_MAX - 1) rc = -2;
+      int mcap = mlen < BW3_IMPORT_MODULE_MAX - 1 ? (int)mlen : BW3_IMPORT_MODULE_MAX - 1;
       if (out->imports) { memcpy(out->imports[fc].module, ip, mcap); out->imports[fc].module[mcap] = 0; }
       ip += mlen;
 
       /* field name */
       uint32_t nlen = leb_u32(&ip, ie);
       if (nlen > (uint32_t)(ie - ip)) break;
-      int ncap = nlen < 127 ? (int)nlen : 127;
+      if (nlen > BW3_EXPORT_NAME_MAX - 1) rc = -2;
+      int ncap = nlen < BW3_EXPORT_NAME_MAX - 1 ? (int)nlen : BW3_EXPORT_NAME_MAX - 1;
       if (out->imports) { memcpy(out->imports[fc].name, ip, ncap); out->imports[fc].name[ncap] = 0; }
       ip += nlen;
+      if (ip >= ie) { if (out->imports) { strcpy(out->imports[fc].sig, "v()"); } fc++; break; }
 
+      if (ip >= ie) break;
       uint8_t kind = *ip++;
 
       if (kind == 0) { /* function */
@@ -323,16 +345,28 @@ parse_wasm_meta (js_env_t *env, const uint8_t *wasm, size_t len, bw3_wasm_meta_t
         }
 
       } else if (kind == 1) { /* table: reftype + limits */
+        imported_tables++;
+        if (ip >= ie) break;
         ip++;
+        if (ip >= ie) break;
         uint8_t flags = *ip++;
         leb_u32(&ip, ie);
         if (flags & 1) leb_u32(&ip, ie);
       } else if (kind == 2) { /* memory: limits */
+        if (ip >= ie) break;
         uint8_t flags = *ip++;
         leb_u32(&ip, ie);
         if (flags & 1) leb_u32(&ip, ie);
       } else if (kind == 3) { /* global: valtype + mutability */
-        ip++; ip++;
+        ip += 2;
+        if (ip > ie) break;
+      } else if (kind == 4) { /* tag: attribute + type index */
+        if (ip >= ie) break;
+        ip++;
+        leb_u32(&ip, ie);
+      } else {
+        /* Unknown kind: stop rather than misparse. */
+        break;
       }
     }
     out->import_count = fc;
@@ -358,7 +392,6 @@ parse_wasm_meta (js_env_t *env, const uint8_t *wasm, size_t len, bw3_wasm_meta_t
   }
 
   /* parse export section */
-  int init_externref_func_idx = -1; /* code-section index of __wbindgen_init_externref_table */
   if (export_sec) {
     const uint8_t *ep = export_sec, *ee = export_sec + export_sz;
     int ec = (int)leb_u32(&ep, ee);
@@ -366,7 +399,9 @@ parse_wasm_meta (js_env_t *env, const uint8_t *wasm, size_t len, bw3_wasm_meta_t
     if (out->exports) for (int i = 0; i < ec && ep < ee; i++) {
       uint32_t nlen = leb_u32(&ep, ee);
       if (nlen > (uint32_t)(ee - ep)) break;
-      int ncap = nlen < 127 ? (int)nlen : 127;
+      if (nlen > sizeof(out->exports[i].name) - 1) rc = -2;
+      int ncap = nlen < sizeof(out->exports[i].name) - 1
+        ? (int)nlen : (int)sizeof(out->exports[i].name) - 1;
       memcpy(out->exports[i].name, ep, ncap);
       out->exports[i].name[ncap] = 0;
       ep += nlen;
@@ -375,18 +410,19 @@ parse_wasm_meta (js_env_t *env, const uint8_t *wasm, size_t len, bw3_wasm_meta_t
       uint32_t func_index = leb_u32(&ep, ee);
       out->exports[i].is_import_reexport   = false;
       out->exports[i].is_externref_return   = false;
+      out->exports[i].first_result          = -1;
+      out->exports[i].is_closure_shim       = false;
+      out->exports[i].is_multi_return       = false;
       if (out->exports[i].kind == 0) {
-        if (strcmp(out->exports[i].name, "__wbindgen_init_externref_table") == 0)
-          init_externref_func_idx = (int)func_index - out->import_count;
+        if (strstr(out->exports[i].name, BW3_CLOSURE_EXPORT_PREFIX) != NULL)
+          out->exports[i].is_closure_shim = true;
         if (out->imports && func_index < (uint32_t)out->import_count) {
           /* Re-export of an import: wasm3 won't find it via m3_FindFunction */
           out->exports[i].is_import_reexport = true;
-          strncpy(out->exports[i].import_module,
-                  out->imports[func_index].module, 63);
-          out->exports[i].import_module[63] = 0;
-          strncpy(out->exports[i].import_name,
-                  out->imports[func_index].name, 127);
-          out->exports[i].import_name[127] = 0;
+          memcpy(out->exports[i].import_module,
+                 out->imports[func_index].module, BW3_IMPORT_MODULE_MAX);
+          memcpy(out->exports[i].import_name,
+                 out->imports[func_index].name, BW3_EXPORT_NAME_MAX);
         } else {
           /* Non-import function: check if it returns externref */
           int fi = (int)func_index - out->import_count;
@@ -398,6 +434,11 @@ parse_wasm_meta (js_env_t *env, const uint8_t *wasm, size_t len, bw3_wasm_meta_t
               if (ft->num_results > 0 && np < (int)sizeof(ft->types) &&
                   ft->types[np] == 0x6f)
                 out->exports[i].is_externref_return = true;
+              /* Raw type: wasm3 reports externref as i32. */
+              if (ft->num_results > 0 && np < (int)sizeof(ft->types))
+                out->exports[i].first_result = ft->types[np];
+              if (ft->num_results > 1)
+                out->exports[i].is_multi_return = true;
             }
           }
         }
@@ -407,51 +448,27 @@ parse_wasm_meta (js_env_t *env, const uint8_t *wasm, size_t len, bw3_wasm_meta_t
     BW3_DBG("parse_wasm_meta: parsed %d exports", out->export_count);
   }
 
-  /* Scan code section for __wbindgen_init_externref_table to find max slot index */
-  out->extref_init_slots = 4; /* default */
-  if (code_sec && init_externref_func_idx >= 0 && init_externref_func_idx < func_type_count) {
-    const uint8_t *cp = code_sec, *ce = code_sec + code_sz;
-    int body_count = (int)leb_u32(&cp, ce);
-    for (int i = 0; i < body_count && cp < ce; i++) {
-      uint32_t body_sz = leb_u32(&cp, ce);
-      const uint8_t *body_end = cp + body_sz;
-      if (body_end > ce) break;
-      if (i == init_externref_func_idx) {
-        /* skip local declarations */
-        int nloc = (int)leb_u32(&cp, ce);
-        for (int j = 0; j < nloc && cp < body_end; j++) {
-          leb_u32(&cp, ce);
-          cp++; /* valtype */
-        }
-        /* scan instructions: find max i32.const value */
-        int max_idx = -1;
-        while (cp < body_end) {
-          uint8_t op = *cp++;
-          if (op == 0x41) { /* i32.const */
-            int cv = (int)leb_u32(&cp, ce);
-            if (cv > max_idx) max_idx = cv;
-          } else if (op == 0x0b) { /* end */
-            break;
-          } else if (op == 0xd0) { /* ref.null */
-            cp++;
-          } else if (op == 0xfb) { /* misc prefix */
-            leb_u32(&cp, ce);
-          } else if (op == 0x26) { /* memory.size/grow */
-            leb_u32(&cp, ce);
-          }
-        }
-        if (max_idx >= 0) out->extref_init_slots = max_idx + 1;
-        break;
-      }
-      cp = body_end;
+  /* wasm3 doesn't size the externref table; wasm-bindgen's constants sit past its min. */
+  out->ext_table_min = 0;
+  if (table_sec) {
+    const uint8_t *tp = table_sec, *te = table_sec + table_sz;
+    uint32_t tc = leb_u32(&tp, te);
+    for (uint32_t i = 0; i < tc && tp < te; i++) {
+      uint8_t reftype = *tp++;
+      if (tp >= te) break;
+      uint8_t flags = *tp++;
+      uint32_t min = leb_u32(&tp, te);
+      if (flags & 1) leb_u32(&tp, te);
+      if (imported_tables + i == BW3_EXT_TABLE_IDX && reftype == 0x6f)
+        out->ext_table_min = min < BW3_EXT_TABLE_MAX_INIT ? min : BW3_EXT_TABLE_MAX_INIT;
     }
-    BW3_DBG("parse_wasm_meta: extref_init_slots=%d", out->extref_init_slots);
+    BW3_DBG("parse_wasm_meta: ext_table_min=%u", out->ext_table_min);
   }
 
   BW3_DBG("parse_wasm_meta: done, types=%d imports=%d exports=%d",
           out->ftype_count, out->import_count, out->export_count);
   free(func_types);
-  return 0;
+  return rc;
 }
 
 /* ─── Module handle ───────────────────────────────────────────────────────── */
@@ -490,7 +507,7 @@ static uint32_t bw3_ext_grow (void *ctx, uint32_t n);
 typedef struct {
   uint32_t  ext_size;   /* logical size (number of live slots) */
   uint32_t  ext_cap;    /* allocated capacity */
-  uint32_t *ext_vals;   /* slot values (indices into JS _extMap) */
+  uint32_t *ext_vals;   /* slot values: opaque externref keys owned by the JS side */
   uint32_t (*grow_fn)(void *ctx, uint32_t n);
 } bw3_ext_ctx_t;
 
@@ -513,7 +530,6 @@ struct bw3_instance {
   /* Externref table — heap-allocated, grows on demand */
   bw3_ext_ctx_t   ext_ctx;
   uint32_t       *ext_vals;
-  js_ref_t       **ext_refs;
 };
 
 /* ─── Handle validation ─────────────────────────────────────────────────── */
@@ -578,7 +594,7 @@ bw3_import_bridge (IM3Runtime runtime, IM3ImportContext ctx, uint64_t *sp, void 
       }
       case 0x7e: { /* i64 */
         int64_t v = *(int64_t *)&arg_sp[i];
-        err = js_create_int64(env, v, &js_args[i]);
+        err = js_create_bigint_int64(env, v, &js_args[i]);
         if (err != 0) return "js_exception";
         break;
       }
@@ -639,9 +655,12 @@ bw3_import_bridge (IM3Runtime runtime, IM3ImportContext ctx, uint64_t *sp, void 
         *(int32_t *)&sp[0] = v;
         break;
       }
-      case 0x7e: { /* i64 */
+      case 0x7e: { /* i64: BigInt like real WebAssembly; Number also accepted */
         int64_t v = 0;
-        js_get_value_int64(env, result, &v);
+        bool is_big = false;
+        js_is_bigint(env, result, &is_big);
+        if (is_big) { bool lossless; js_get_value_bigint_int64(env, result, &v, &lossless); }
+        else js_get_value_int64(env, result, &v);
         *(int64_t *)&sp[0] = v;
         break;
       }
@@ -716,9 +735,14 @@ bw3_module_new (js_env_t *env, js_callback_info_t *info) {
   mod->js_buf_ref = buf_ref;
   mod->env        = env;
 
-  if (parse_wasm_meta(env, mod->wasm_bytes, mod->wasm_len, &mod->meta) != 0) {
+  int prc = parse_wasm_meta(env, mod->wasm_bytes, mod->wasm_len, &mod->meta);
+  if (prc != 0) {
+    bw3_wasm_meta_free(&mod->meta);
     js_delete_reference(env, buf_ref);
     free(mod);
+    if (prc == -2)
+      BW3_THROW("moduleNew: import/export name too long (max 127-byte module, "
+                "511-byte import/export name)");
     BW3_THROW("moduleNew: invalid WASM binary");
   }
 
@@ -781,6 +805,22 @@ bw3_module_meta (js_env_t *env, js_callback_info_t *info) {
     js_set_element(env, return_exports_arr, arr_len, name_str);
   }
 
+  /* multiReturnExports: functions with more than one result */
+  js_value_t *multi_return_arr;
+  err = js_create_array_with_length(env, 0, &multi_return_arr);
+  if (err != 0) BW3_THROW("moduleMeta: out of memory");
+
+  for (int i = 0; i < meta->export_count; i++) {
+    if (!meta->exports[i].is_multi_return) continue;
+    js_value_t *name_str;
+    err = js_create_string_utf8(env, (const utf8_t *)meta->exports[i].name,
+                                strlen(meta->exports[i].name), &name_str);
+    if (err != 0) BW3_THROW("moduleMeta: string create failed");
+    uint32_t arr_len;
+    js_get_array_length(env, multi_return_arr, &arr_len);
+    js_set_element(env, multi_return_arr, arr_len, name_str);
+  }
+
   /* returnImportKeys + importParamInfo */
   js_value_t *return_import_keys_arr;
   err = js_create_array_with_length(env, 0, &return_import_keys_arr);
@@ -793,12 +833,7 @@ bw3_module_meta (js_env_t *env, js_callback_info_t *info) {
   for (int i = 0; i < meta->import_count; i++) {
     bw3_import_desc_t *desc = &meta->imports[i];
 
-    char key[194];
-    {
-      size_t ml = strlen(desc->module);
-      size_t nl = strlen(desc->name);
-      if (ml + 1 + nl >= 192) continue;
-    }
+    char key[BW3_IMPORT_MODULE_MAX + BW3_EXPORT_NAME_MAX];
     snprintf(key, sizeof(key), "%s.%s", desc->module, desc->name);
 
     /* returnImportKeys */
@@ -845,13 +880,9 @@ bw3_module_meta (js_env_t *env, js_callback_info_t *info) {
   if (err != 0) BW3_THROW("moduleMeta: out of memory");
   js_set_named_property(env, result_obj, "returnExports", return_exports_arr);
   js_set_named_property(env, result_obj, "returnImportKeys", return_import_keys_arr);
+  js_set_named_property(env, result_obj, "multiReturnExports", multi_return_arr);
   js_set_named_property(env, result_obj, "importParamInfo", import_param_info_obj);
 
-  /* extrefInitSlots: max slot index + 1 used by init_externref_table */
-  js_value_t *slots_val;
-  err = js_create_uint32(env, (uint32_t)meta->extref_init_slots, &slots_val);
-  if (err != 0) BW3_THROW("moduleMeta: out of memory");
-  js_set_named_property(env, result_obj, "extrefInitSlots", slots_val);
 
   return result_obj;
 }
@@ -909,17 +940,15 @@ bw3_instance_new (js_env_t *env, js_callback_info_t *info) {
     BW3_THROW("instanceNew: m3_NewEnvironment failed");
   }
 
-  uint32_t ext_init_cap = (uint32_t)mod->meta.extref_init_slots;
+  uint32_t ext_init_cap = mod->meta.ext_table_min;
   if (ext_init_cap < 256) ext_init_cap = 256;
   inst->ext_vals = (uint32_t *)calloc(ext_init_cap, sizeof(uint32_t));
-  inst->ext_refs = (js_ref_t **)calloc(ext_init_cap, sizeof(js_ref_t *));
-  if (!inst->ext_vals || !inst->ext_refs) {
-    free(inst->ext_vals); free(inst->ext_refs);
+  if (!inst->ext_vals) {
     m3_FreeEnvironment(inst->m3env);
     free(inst->bridges); free(inst->tombstones); free(inst);
     BW3_THROW("instanceNew: out of memory for externref table");
   }
-  inst->ext_ctx.ext_size = 0;
+  inst->ext_ctx.ext_size = mod->meta.ext_table_min;
   inst->ext_ctx.ext_cap  = ext_init_cap;
   inst->ext_ctx.ext_vals = inst->ext_vals;
   inst->ext_ctx.grow_fn  = bw3_ext_grow;
@@ -1061,11 +1090,42 @@ bw3_instance_new (js_env_t *env, js_callback_info_t *info) {
   err = js_create_object(env, &exports_map);
   if (err != 0) goto build_fail;
 
+  /* externrefResultExports: functions returning externref first. */
+  js_value_t *externref_result_map;
+  err = js_create_object(env, &externref_result_map);
+  if (err != 0) goto build_fail;
+
   for (int i = 0; i < meta->export_count; i++) {
     js_value_t *kind_val;
     err = js_create_uint32(env, meta->exports[i].kind, &kind_val);
     if (err != 0) goto build_fail;
     err = js_set_named_property(env, exports_map, meta->exports[i].name, kind_val);
+    if (err != 0) goto build_fail;
+
+    /* externrefResultExports: functions whose first result is externref */
+    if (meta->exports[i].kind == 0 && meta->exports[i].first_result == 0x6f) {
+      js_value_t *flag;
+      err = js_get_boolean(env, true, &flag);
+      if (err != 0) goto build_fail;
+      err = js_set_named_property(env, externref_result_map, meta->exports[i].name, flag);
+      if (err != 0) goto build_fail;
+    }
+  }
+
+  /* closureExports: { suffix: exportName }, to resolve shims across crate hashes. */
+  js_value_t *closure_exports;
+  err = js_create_object(env, &closure_exports);
+  if (err != 0) goto build_fail;
+
+  for (int i = 0; i < meta->export_count; i++) {
+    if (!meta->exports[i].is_closure_shim) continue;
+    const char *suffix = strstr(meta->exports[i].name, BW3_CLOSURE_EXPORT_PREFIX)
+                       + sizeof(BW3_CLOSURE_EXPORT_PREFIX) - 1;
+    js_value_t *name_val;
+    err = js_create_string_utf8(env, (const utf8_t *)meta->exports[i].name,
+                                strlen(meta->exports[i].name), &name_val);
+    if (err != 0) goto build_fail;
+    err = js_set_named_property(env, closure_exports, suffix, name_val);
     if (err != 0) goto build_fail;
   }
 
@@ -1103,7 +1163,11 @@ bw3_instance_new (js_env_t *env, js_callback_info_t *info) {
   if (err != 0) goto build_fail;
   err = js_set_named_property(env, result_obj, "exportsMap", exports_map);
   if (err != 0) goto build_fail;
+  err = js_set_named_property(env, result_obj, "externrefResultExports", externref_result_map);
+  if (err != 0) goto build_fail;
   err = js_set_named_property(env, result_obj, "importReexports", import_reexports);
+  if (err != 0) goto build_fail;
+  err = js_set_named_property(env, result_obj, "closureExports", closure_exports);
   if (err != 0) goto build_fail;
 
   return result_obj;
@@ -1123,9 +1187,6 @@ build_fail:
       if (inst->bridges[i].fn_ref) js_delete_reference(env, inst->bridges[i].fn_ref);
     for (int i = 0; i < inst->tombstone_count; i++)
       if (inst->tombstones[i].msg) { free(inst->tombstones[i].msg); inst->tombstones[i].msg = NULL; }
-    for (uint32_t i = 0; i < inst->ext_ctx.ext_cap; i++)
-      if (inst->ext_refs[i]) js_delete_reference(env, inst->ext_refs[i]);
-    free(inst->ext_refs);
     free(inst->ext_vals);
     if (inst->m3rt)  m3_FreeRuntime(inst->m3rt);
     if (inst->m3env) m3_FreeEnvironment(inst->m3env);
@@ -1137,24 +1198,29 @@ build_fail:
 }
 
 /**
- * callExport(instanceHandle, name: string, args: any[]) → any
- *
+ * callExport(instanceHandle, name: string, args: any[], isClosure?: bool) → any
  * Calls a WASM export function by name with the provided JS arguments.
  * Converts between JS values and wasm3 typed values.
+ *
+ * isClosure: args[0] is the shim name and is skipped.
  */
 static js_value_t *
 bw3_call_export (js_env_t *env, js_callback_info_t *info) {
   int err;
   M3Result m3err;
 
-  size_t argc = 3;
-  js_value_t *argv[3];
+  size_t argc = 4;
+  js_value_t *argv[4];
   err = js_get_callback_info(env, info, &argc, argv, NULL, NULL);
   if (err != 0) return NULL;
 
   /* Instance handle — validate magic */
   bw3_instance_t *inst = bw3_validate_instance(env, argv[0]);
   if (!inst) BW3_THROW("callExport: invalid instance handle");
+
+  /* Optional isClosure flag */
+  bool is_closure = false;
+  if (argc > 3 && argv[3] != NULL) js_get_value_bool(env, argv[3], &is_closure);
 
   /* Function name */
   size_t name_len = 0;
@@ -1168,16 +1234,20 @@ bw3_call_export (js_env_t *env, js_callback_info_t *info) {
   }
   fn_name[name_len] = 0;
 
+  /* Keep the name for error messages. */
+  char *export_name_saved = (char *)malloc(name_len + 1);
+  if (!export_name_saved) { free(fn_name); BW3_THROW("callExport: out of memory"); }
+  memcpy(export_name_saved, fn_name, name_len + 1);
+
+  uint32_t arg_offset = 0;
   IM3Function fn;
+
+  /* Closure shims resolve by name; skip the prepended shim name arg. */
+  if (is_closure) arg_offset = 1;
+
   m3err = m3_FindFunction(&fn, inst->m3rt, (const char *)fn_name);
-
-  // Save the name for error messages before freeing
-  char export_name_saved[128];
-  strncpy(export_name_saved, (const char *)fn_name, 127);
-  export_name_saved[127] = 0;
   free(fn_name);
-
-  if (m3err) BW3_THROW(m3err);
+  if (m3err) { char errbuf[BW3_EXPORT_NAME_MAX + 32]; snprintf(errbuf, sizeof(errbuf), "%s: %s", export_name_saved, m3err); free(export_name_saved); BW3_THROW(errbuf); }
 
   uint32_t wasm_argc = m3_GetArgCount(fn);
   uint32_t wasm_retc = m3_GetRetCount(fn);
@@ -1185,16 +1255,16 @@ bw3_call_export (js_env_t *env, js_callback_info_t *info) {
   BW3_DBG("callExport: fn=%s argc_wasm=%d retc=%d", export_name_saved, wasm_argc, wasm_retc);
 
   /* Read JS args → typed WASM values */
-  int32_t  i32v[BW3_MAX_FN_ARGS];
-  int64_t  i64v[BW3_MAX_FN_ARGS];
-  float    f32v[BW3_MAX_FN_ARGS];
-  double   f64v[BW3_MAX_FN_ARGS];
+  int32_t  i32v[BW3_MAX_FN_ARGS] = {0};
+  int64_t  i64v[BW3_MAX_FN_ARGS] = {0};
+  float    f32v[BW3_MAX_FN_ARGS] = {0};
+  double   f64v[BW3_MAX_FN_ARGS] = {0};
   const void *arg_ptrs[BW3_MAX_FN_ARGS];
 
   uint32_t n = wasm_argc < (uint32_t)BW3_MAX_FN_ARGS ? wasm_argc : (uint32_t)BW3_MAX_FN_ARGS;
   for (uint32_t i = 0; i < n; i++) {
     js_value_t *el = NULL;
-    if (js_get_element(env, argv[2], i, &el) != 0 || el == NULL) {
+    if (js_get_element(env, argv[2], i + arg_offset, &el) != 0 || el == NULL) {
       i32v[i] = 0; arg_ptrs[i] = &i32v[i]; continue;
     }
     M3ValueType vt = m3_GetArgType(fn, i);
@@ -1203,10 +1273,19 @@ bw3_call_export (js_env_t *env, js_callback_info_t *info) {
         js_get_value_int32(env, el, &i32v[i]);
         arg_ptrs[i] = &i32v[i];
         break;
-      case c_m3Type_i64:
-        js_get_value_int64(env, el, &i64v[i]);
+      case c_m3Type_i64: {
+        /* WebAssembly passes i64 as BigInt; accept plain Numbers too. */
+        bool is_big = false;
+        js_is_bigint(env, el, &is_big);
+        if (is_big) {
+          bool lossless;
+          js_get_value_bigint_int64(env, el, &i64v[i], &lossless);
+        } else {
+          js_get_value_int64(env, el, &i64v[i]);
+        }
         arg_ptrs[i] = &i64v[i];
         break;
+      }
       case c_m3Type_f32: {
         double d = 0;
         js_get_value_double(env, el, &d);
@@ -1227,74 +1306,94 @@ bw3_call_export (js_env_t *env, js_callback_info_t *info) {
 
   /* Call */
   inst->js_exc_pending = false;
+  /* Defensive: never let m3_GetResults() read a previous call's results. */
+  inst->m3rt->lastCalled = NULL;
   m3err = m3_Call(fn, n, arg_ptrs);
   BW3_DBG("callExport: m3_Call → %s", m3err ? m3err : "OK");
 
   if (m3err) {
     if (inst->js_exc_pending) {
       inst->js_exc_pending = false;
+      free(export_name_saved);
       return NULL;
     }
-    char errbuf[320];
+    char errbuf[BW3_EXPORT_NAME_MAX + 32];
     snprintf(errbuf, sizeof(errbuf), "%s: %s", export_name_saved, m3err);
+    free(export_name_saved);
     BW3_THROW(errbuf);
   }
+  free(export_name_saved);
 
   /* Return value(s) */
+  /* Multi-value: read all results before the next call overwrites them. */
   if (wasm_retc == 0) {
     js_value_t *undef;
     js_get_undefined(env, &undef);
     return undef;
   }
-
-  uint32_t nr = wasm_retc < (uint32_t)BW3_MAX_FN_ARGS ? wasm_retc : (uint32_t)BW3_MAX_FN_ARGS;
-  int32_t  ret_i32v[BW3_MAX_FN_ARGS];
-  int64_t  ret_i64v[BW3_MAX_FN_ARGS];
-  float    ret_f32v[BW3_MAX_FN_ARGS];
-  double   ret_f64v[BW3_MAX_FN_ARGS];
-  const void *ret_ptrs[BW3_MAX_FN_ARGS];
-
-  for (uint32_t i = 0; i < nr; i++) {
-    M3ValueType vt = m3_GetRetType(fn, i);
-    switch (vt) {
-      case c_m3Type_i32: ret_ptrs[i] = &ret_i32v[i]; break;
-      case c_m3Type_i64: ret_ptrs[i] = &ret_i64v[i]; break;
-      case c_m3Type_f32: ret_ptrs[i] = &ret_f32v[i]; break;
-      case c_m3Type_f64: ret_ptrs[i] = &ret_f64v[i]; break;
-      default:           ret_ptrs[i] = &ret_i32v[i]; break;
+  if (wasm_retc > (uint32_t)BW3_MAX_RET_VALS)
+    BW3_THROW("callExport: too many results (max " "16" ")");
+  if (wasm_retc > 1) {
+    uint32_t nr = wasm_retc;
+    int32_t  ret_i32v[BW3_MAX_RET_VALS];
+    int64_t  ret_i64v[BW3_MAX_RET_VALS];
+    float    ret_f32v[BW3_MAX_RET_VALS];
+    double   ret_f64v[BW3_MAX_RET_VALS];
+    const void *ret_ptrs[BW3_MAX_RET_VALS];
+    for (uint32_t i = 0; i < nr; i++) {
+      switch (m3_GetRetType(fn, i)) {
+        case c_m3Type_i64: ret_ptrs[i] = &ret_i64v[i]; break;
+        case c_m3Type_f32: ret_ptrs[i] = &ret_f32v[i]; break;
+        case c_m3Type_f64: ret_ptrs[i] = &ret_f64v[i]; break;
+        default:           ret_ptrs[i] = &ret_i32v[i]; break;
+      }
     }
-  }
-  m3_GetResults(fn, nr, ret_ptrs);
+    if (m3_GetResults(fn, nr, ret_ptrs) != NULL)
+      BW3_THROW("callExport: failed to read results");
 
-  if (wasm_retc == 1) {
+    js_value_t *arr;
+    js_create_array_with_length(env, nr, &arr);
+    for (uint32_t i = 0; i < nr; i++) {
+      js_value_t *el = NULL;
+      switch (m3_GetRetType(fn, i)) {
+        case c_m3Type_i64: js_create_bigint_int64(env, ret_i64v[i], &el);      break;
+        case c_m3Type_f32: js_create_double(env, (double)ret_f32v[i], &el);    break;
+        case c_m3Type_f64: js_create_double(env, (double)ret_f64v[i], &el);    break;
+        default:           js_create_int32(env, ret_i32v[i], &el);             break;
+      }
+      js_set_element(env, arr, i, el);
+
+    }
+    return arr;
+  }
+
+  /* Single result */
+  {
+    int32_t  ret_i32v[1];
+    int64_t  ret_i64v[1];
+    float    ret_f32v[1];
+    double   ret_f64v[1];
+    const void *ret_ptrs[1];
     M3ValueType rt = m3_GetRetType(fn, 0);
+    switch (rt) {
+      case c_m3Type_i64: ret_ptrs[0] = &ret_i64v[0]; break;
+      case c_m3Type_f32: ret_ptrs[0] = &ret_f32v[0]; break;
+      case c_m3Type_f64: ret_ptrs[0] = &ret_f64v[0]; break;
+      default:           ret_ptrs[0] = &ret_i32v[0]; break;
+    }
+    if (m3_GetResults(fn, 1, ret_ptrs) != NULL)
+      BW3_THROW("callExport: failed to read result");
+
     js_value_t *ret_val;
     switch (rt) {
       case c_m3Type_i32: js_create_int32(env, ret_i32v[0], &ret_val);             break;
-      case c_m3Type_i64: js_create_int64(env, ret_i64v[0], &ret_val);             break;
+      case c_m3Type_i64: js_create_bigint_int64(env, ret_i64v[0], &ret_val);      break;
       case c_m3Type_f32: js_create_double(env, (double)ret_f32v[0], &ret_val);    break;
       case c_m3Type_f64: js_create_double(env, ret_f64v[0], &ret_val);            break;
       default:           js_get_undefined(env, &ret_val);                          break;
     }
     return ret_val;
   }
-
-  /* Multi-return: return JS Array matching WebAssembly.Instance semantics */
-  js_value_t *arr;
-  js_create_array_with_length(env, nr, &arr);
-  for (uint32_t i = 0; i < nr; i++) {
-    M3ValueType vt = m3_GetRetType(fn, i);
-    js_value_t *el;
-    switch (vt) {
-      case c_m3Type_i32: js_create_int32(env, ret_i32v[i], &el);             break;
-      case c_m3Type_i64: js_create_int64(env, ret_i64v[i], &el);             break;
-      case c_m3Type_f32: js_create_double(env, (double)ret_f32v[i], &el);    break;
-      case c_m3Type_f64: js_create_double(env, ret_f64v[i], &el);            break;
-      default:           js_get_undefined(env, &el);                          break;
-    }
-    js_set_element(env, arr, i, el);
-  }
-  return arr;
 }
 
 /**
@@ -1330,6 +1429,7 @@ bw3_get_memory (js_env_t *env, js_callback_info_t *info) {
     return undef;
   }
 
+  /* No linear memory -> undefined. */
   uint32_t mem_size = 0;
   uint8_t *mem_ptr  = m3_GetMemory(inst->m3rt, &mem_size, 0);
   if (!mem_ptr || mem_size == 0) {
@@ -1398,8 +1498,9 @@ bw3_get_memory (js_env_t *env, js_callback_info_t *info) {
 
 /* ─── Externref table JS bindings ─────────────────────────────────────────── */
 
-/* tableSet(instHandle, idx: u32, val: any) → undefined
- * Stores a persistent JS reference in the externref table at slot `idx`. */
+/* Externref table slots hold JS-side keys (0 = ref.null). */
+
+/* tableSet(instHandle, idx: u32, key: u32) → undefined */
 static js_value_t *
 bw3_table_set (js_env_t *env, js_callback_info_t *info) {
   int err;
@@ -1411,36 +1512,18 @@ bw3_table_set (js_env_t *env, js_callback_info_t *info) {
   bw3_instance_t *inst = bw3_validate_instance(env, argv[0]);
   if (!inst) BW3_THROW("tableSet: invalid instance handle");
 
-  uint32_t idx = 0;
+  uint32_t idx = 0, key = 0;
   js_get_value_uint32(env, argv[1], &idx);
-  if (idx >= inst->ext_ctx.ext_cap || idx >= inst->ext_ctx.ext_size) {
-    js_throw_error(env, NULL, "tableSet: index out of range");
-    return NULL;
-  }
-
-  /* Delete old reference if present */
-  if (inst->ext_refs[idx]) {
-    js_delete_reference(env, inst->ext_refs[idx]);
-    inst->ext_refs[idx] = NULL;
-  }
-
-  /* Skip storing if value is null or undefined */
-  bool is_null = false, is_undef = false;
-  js_is_null(env, argv[2], &is_null);
-  js_is_undefined(env, argv[2], &is_undef);
-  if (!is_null && !is_undef) {
-    js_ref_t *ref;
-    err = js_create_reference(env, argv[2], 1, &ref);
-    if (err == 0) inst->ext_refs[idx] = ref;
-  }
+  js_get_value_uint32(env, argv[2], &key);
+  if (idx >= inst->ext_ctx.ext_size) BW3_THROW("tableSet: index out of range");
+  inst->ext_vals[idx] = key;
 
   js_value_t *undef;
   js_get_undefined(env, &undef);
   return undef;
 }
 
-/* tableGet(instHandle, idx: u32) → any
- * Returns the JS value stored at externref table slot `idx`. */
+/* tableGet(instHandle, idx: u32) → u32 key, or undefined when out of range */
 static js_value_t *
 bw3_table_get (js_env_t *env, js_callback_info_t *info) {
   int err;
@@ -1454,20 +1537,34 @@ bw3_table_get (js_env_t *env, js_callback_info_t *info) {
 
   uint32_t idx = 0;
   js_get_value_uint32(env, argv[1], &idx);
-  if (idx >= inst->ext_ctx.ext_cap || !inst->ext_refs[idx]) {
-    js_value_t *undef;
-    js_get_undefined(env, &undef);
-    return undef;
-  }
 
-  js_value_t *val;
-  err = js_get_reference_value(env, inst->ext_refs[idx], &val);
-  if (err != 0) {
-    js_value_t *undef;
-    js_get_undefined(env, &undef);
-    return undef;
-  }
-  return val;
+  js_value_t *ret;
+  if (idx >= inst->ext_ctx.ext_size) js_get_undefined(env, &ret);
+  else if (js_create_uint32(env, inst->ext_vals[idx], &ret) != 0) return NULL;
+  return ret;
+}
+
+/* tableKeys(instHandle) -> Uint32Array copy of all keys */
+static js_value_t *
+bw3_table_keys (js_env_t *env, js_callback_info_t *info) {
+  int err;
+  size_t argc = 1;
+  js_value_t *argv[1];
+  err = js_get_callback_info(env, info, &argc, argv, NULL, NULL);
+  if (err != 0) return NULL;
+
+  bw3_instance_t *inst = bw3_validate_instance(env, argv[0]);
+  if (!inst) BW3_THROW("tableKeys: invalid instance handle");
+
+  size_t n = inst->ext_ctx.ext_size;
+  void *data;
+  js_value_t *buf, *arr;
+  err = js_create_arraybuffer(env, n * sizeof(uint32_t), &data, &buf);
+  if (err != 0) BW3_THROW("tableKeys: out of memory");
+  if (n) memcpy(data, inst->ext_vals, n * sizeof(uint32_t));
+  err = js_create_typedarray(env, js_uint32array, n, buf, 0, &arr);
+  if (err != 0) BW3_THROW("tableKeys: failed to create result");
+  return arr;
 }
 
 /* Called by the wasm3 op_ExtTableGrow ops via the grow_fn function pointer.
@@ -1486,13 +1583,10 @@ bw3_ext_grow (void *vctx, uint32_t n) {
   }
   uint32_t new_cap = ctx->ext_cap * 2;
   if (new_cap < new_end) new_cap = new_end;
-  uint32_t  *new_vals = (uint32_t  *)realloc(inst->ext_vals, new_cap * sizeof(uint32_t));
-  js_ref_t **new_refs = (js_ref_t **)realloc(inst->ext_refs, new_cap * sizeof(js_ref_t *));
-  if (!new_vals || !new_refs) { free(new_vals); free(new_refs); return (uint32_t)(-1); }
+  uint32_t *new_vals = (uint32_t *)realloc(inst->ext_vals, new_cap * sizeof(uint32_t));
+  if (!new_vals) return (uint32_t)(-1);
   memset(new_vals + ctx->ext_cap, 0, (new_cap - ctx->ext_cap) * sizeof(uint32_t));
-  memset(new_refs + ctx->ext_cap, 0, (new_cap - ctx->ext_cap) * sizeof(js_ref_t *));
   inst->ext_vals   = new_vals;
-  inst->ext_refs   = new_refs;
   ctx->ext_cap     = new_cap;
   ctx->ext_vals    = new_vals;
   ctx->ext_size    = new_end;
@@ -1541,34 +1635,6 @@ bw3_table_size (js_env_t *env, js_callback_info_t *info) {
   js_value_t *ret;
   err = js_create_uint32(env, inst->ext_ctx.ext_size, &ret);
   if (err != 0) BW3_THROW("tableSize: failed to create result");
-  return ret;
-}
-
-/* extvalGet(instHandle, idx: u32) → u32
- * Returns inst->ext_vals[idx] — the i32 externref slot index stored by WASM
- * table.set instructions (op_ExtTableSet).  JS uses this to resolve externref
- * args that live in wasm3's internal ext_vals table but not in _extMap. */
-static js_value_t *
-bw3_extval_get (js_env_t *env, js_callback_info_t *info) {
-  int err;
-  size_t argc = 2;
-  js_value_t *argv[2];
-  err = js_get_callback_info(env, info, &argc, argv, NULL, NULL);
-  if (err != 0) return NULL;
-
-  bw3_instance_t *inst = bw3_validate_instance(env, argv[0]);
-  if (!inst) BW3_THROW("extvalGet: invalid instance handle");
-
-  uint32_t idx = 0;
-  js_get_value_uint32(env, argv[1], &idx);
-
-  js_value_t *ret;
-  if (idx >= inst->ext_ctx.ext_cap) {
-    js_get_undefined(env, &ret);
-  } else {
-    err = js_create_uint32(env, inst->ext_vals[idx], &ret);
-    if (err != 0) { js_get_undefined(env, &ret); return ret; }
-  }
   return ret;
 }
 
@@ -1676,14 +1742,6 @@ bw3_instance_free (js_env_t *env, js_callback_info_t *info) {
     }
   }
 
-  /* Free externref table JS references */
-  for (uint32_t i = 0; i < inst->ext_ctx.ext_cap; i++) {
-    if (inst->ext_refs[i]) {
-      js_delete_reference(env, inst->ext_refs[i]);
-      inst->ext_refs[i] = NULL;
-    }
-  }
-  free(inst->ext_refs);
   free(inst->ext_vals);
 
   if (inst->m3rt)  m3_FreeRuntime(inst->m3rt);
@@ -1721,7 +1779,7 @@ bw3_exports (js_env_t *env, js_value_t *exports) {
   V("tableSet",     bw3_table_set)
   V("tableGet",     bw3_table_get)
   V("tableGrow",    bw3_table_grow)
-  V("extvalGet",    bw3_extval_get)
+  V("tableKeys",    bw3_table_keys)
   V("tableSize",    bw3_table_size)
 
 #undef V

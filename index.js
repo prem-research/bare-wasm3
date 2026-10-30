@@ -10,31 +10,104 @@ function _log (msg) { if (_debug) console.log(msg) }
 const FINGERPRINT_SAMPLE_BYTES = 64
 /* Log display: truncate fingerprint key to this many chars */
 const FINGERPRINT_LOG_LEN = 20
-/* wasm-bindgen reserves slots 0-3 (undefined, null, true, false) */
-const WBINDGEN_RESERVED_SLOTS = 4
-/* wasm-bindgen slot 0 is always undefined */
-const WBINDGEN_SLOT_UNDEFINED = 0
-/* Max externref slot index — stays within WASM i32 range */
-const EXT_SLOT_MAX = 0x7FFFFFFF
+/* Externref keys: 0 = ref.null, 1-3 fixed primitives, the rest index _extMap. */
+const EXT_KEY_NULL = 0
+const EXT_KEY_UNDEFINED = 1
+const EXT_KEY_TRUE = 2
+const EXT_KEY_FALSE = 3
+const EXT_KEY_FIRST_FREE = 4
 /* wasm-bindgen appends a 16-char hex hash suffix to mangled import names */
 const WBINDGEN_SUFFIX_RE = /_[0-9a-f]{16}$/
-/* queueMicrotask has exactly 2 params in wasm-bindgen's calling convention */
-const WBINDGEN_QUEUE_MICROTASK_PARAMS = 2
-/* __wbg_call needs at least 2 params (fn, this) */
-const WBINDGEN_CALL_MIN_PARAMS = 2
+/* Suffix of wasm-bindgen 0.2.121+ closure shim export names. */
+const WBINDGEN_CLOSURE_PREFIX = '___convert__closures_____invoke___'
 /* Export kind codes returned by binding.instanceNew exportsMap */
 const EXPORT_KIND_FUNCTION = 0
 const EXPORT_KIND_TABLE    = 1
 const EXPORT_KIND_MEMORY   = 2
-/* table.grow returns this uint32 value on failure (== -1 as i32) */
-const EXT_GROW_FAIL = 0xFFFFFFFF
 /* memory.grow from JS is unsupported — wasm3 manages memory internally */
 const MEMORY_GROW_UNSUPPORTED = -1
+/* WASM binary value/section codes used by _exportParamTypes */
+const WASM_VT_I32 = 0x7f
+const WASM_VT_I64 = 0x7e
+const WASM_VT_EXTERNREF = 0x6f
+const WASM_FUNCTYPE = 0x60
+const WASM_SEC_TYPE = 1
+const WASM_SEC_IMPORT = 2
+const WASM_SEC_FUNCTION = 3
+const WASM_SEC_EXPORT = 7
 
 const _moduleCache = new Map()
 
 function _fingerprint(buf) {
   return buf.length + ':' + buf.slice(0, FINGERPRINT_SAMPLE_BYTES).toString('hex')
+}
+
+/* JSON.stringify that survives BigInt (i64) values, for error logs only. */
+function _safeJson (v) {
+  try { return JSON.stringify(v, (k, x) => typeof x === 'bigint' ? x.toString() + 'n' : x) } catch { return '?' }
+}
+
+/* Raw param types per export (C reports externref as i32); null if unparseable. */
+function _exportParamTypes (buf) {
+  try {
+    let p = 8
+    const leb = (end) => {
+      let v = 0, s = 0, b
+      do {
+        if (p >= end) throw new Error('truncated')
+        b = buf[p++]
+        if (s < 32) v |= (b & 0x7f) << s
+        s += 7
+      } while (b & 0x80)
+      return v >>> 0
+    }
+    const skipLimits = (end) => { const flags = buf[p++]; leb(end); if (flags & 1) leb(end) }
+    const types = []
+    const funcTypes = []
+    const out = new Map()
+    while (p < buf.length) {
+      const id = buf[p++]
+      const size = leb(buf.length)
+      const end = p + size
+      if (end > buf.length) return null
+      if (id === WASM_SEC_TYPE) {
+        for (let n = leb(end); n > 0; n--) {
+          if (buf[p++] !== WASM_FUNCTYPE) return null
+          const params = []
+          for (let np = leb(end); np > 0; np--) params.push(buf[p++])
+          const nr = leb(end)
+          p += nr
+          types.push(params)
+        }
+      } else if (id === WASM_SEC_IMPORT) {
+        for (let n = leb(end); n > 0; n--) {
+          for (let field = 0; field < 2; field++) { const len = leb(end); p += len }
+          const kind = buf[p++]
+          if (kind === 0) funcTypes.push(types[leb(end)])
+          else if (kind === 1) { p++; skipLimits(end) }
+          else if (kind === 2) skipLimits(end)
+          else if (kind === 3) p += 2
+          else if (kind === 4) { p++; leb(end) }
+          else return null
+        }
+      } else if (id === WASM_SEC_FUNCTION) {
+        for (let n = leb(end); n > 0; n--) funcTypes.push(types[leb(end)])
+      } else if (id === WASM_SEC_EXPORT) {
+        for (let n = leb(end); n > 0; n--) {
+          const len = leb(end)
+          const name = buf.toString('utf8', p, p + len)
+          p += len
+          const kind = buf[p++]
+          const idx = leb(end)
+          if (kind === 0 && funcTypes[idx]) out.set(name, funcTypes[idx])
+        }
+      }
+      p = end
+    }
+    return out
+  } catch {
+    return null
+  }
 }
 
 class Module {
@@ -48,14 +121,21 @@ class Module {
       buf = bytes
     }
 
-    const useCache = options?.cache !== false
+    let useCache = options?.cache !== false
     const key = _fingerprint(buf)
     _log(PREFIX + ' Module len=' + buf.length + ' key=' + key.slice(0, FINGERPRINT_LOG_LEN) + (useCache ? ' cache=on' : ''))
+
+    /* Fingerprint only samples the head; compare full bytes. */
+    if (useCache && _moduleCache.has(key) && !_moduleCache.get(key).bytes.equals(buf)) {
+      _log(PREFIX + ' Module fingerprint collision, not caching')
+      useCache = false
+    }
 
     if (useCache && _moduleCache.has(key)) {
       const entry = _moduleCache.get(key)
       this._handle = entry.handle
       this._meta = entry.meta
+      this._exportParams = entry.exportParams
       this._key = key
       this._cached = true
       _log(PREFIX + ' Module CACHED')
@@ -69,11 +149,12 @@ class Module {
     _log(PREFIX + ' moduleNew start')
     this._handle = binding.moduleNew(ab)
     this._meta = binding.moduleMeta(this._handle)
+    this._exportParams = _exportParamTypes(buf)
     _log(PREFIX + ' moduleNew done')
     this._key = key
     this._cached = false
     if (useCache) {
-      _moduleCache.set(key, { handle: this._handle, meta: this._meta })
+      _moduleCache.set(key, { handle: this._handle, meta: this._meta, exportParams: this._exportParams, bytes: Buffer.from(ab) })
       this._cached = true
     }
   }
@@ -104,67 +185,59 @@ class Instance {
       }
     }
 
-    // ── Externref polyfill state ─────────────────────────────────────────────
+    // ── Externref state ──────────────────────────────────────────────────────
+    /* key -> JS value; unreferenced keys are swept after the outermost export call. */
     const _extMap = new Map()
-    const _EXT_TOMBSTONE = Symbol('ext-tombstone')
-    const _deallocdSlots = new Set()
-    const _registry = new FinalizationRegistry((idx) => {
-      if (_deallocdSlots.has(idx)) {
-        _deallocdSlots.delete(idx)
-        return
-      }
-      _extMap.set(idx, _EXT_TOMBSTONE)
-    })
+    const _extFreeKeys = []
+    let _extNextKey = EXT_KEY_FIRST_FREE
+    let _extStoredSinceSweep = false
 
-    let _extNextIdx = _meta.extrefInitSlots || WBINDGEN_RESERVED_SLOTS
-    const _extUndefinedSlot = _extNextIdx++
     let _traceAllImports = false
     let _inCallExport = 0
-    const _pendingMicrotasks = []
     let _instHandle = null
     let _prevMemBuf = null
 
-    function _resolveExtref (slot) {
-      if (_extMap.has(slot)) {
-        const v = _extMap.get(slot)
-        return v === _EXT_TOMBSTONE ? undefined : v
+    function _checkMemoryGrow (where) {
+      if (_instHandle === null) return
+      const mb = binding.getMemory(_instHandle)
+      if (!mb) return
+      if (mb.byteLength !== _prevMemBuf?.byteLength) {
+        _log(PREFIX + ' mem@' + where + ' grow detected: ' + (_prevMemBuf ? _prevMemBuf.byteLength : 0) + ' -> ' + mb.byteLength)
+        _prevMemBuf = mb
       }
-      if (_instHandle !== null) {
-        const inner = binding.extvalGet(_instHandle, slot)
-        if (inner > 0 && _extMap.has(inner)) {
-          const v2 = _extMap.get(inner)
-          return v2 === _EXT_TOMBSTONE ? undefined : v2
-        }
-      }
-      return undefined
+    }
+
+    function _resolveExtref (key) {
+      if (key === EXT_KEY_NULL) return null
+      if (key === EXT_KEY_UNDEFINED) return undefined
+      if (key === EXT_KEY_TRUE) return true
+      if (key === EXT_KEY_FALSE) return false
+      return _extMap.get(key)
+    }
+
+    /* JS value -> externref key handed to wasm */
+    function _toExtref (a) {
+      if (a === null) return EXT_KEY_NULL
+      if (a === undefined) return EXT_KEY_UNDEFINED
+      if (a === true) return EXT_KEY_TRUE
+      if (a === false) return EXT_KEY_FALSE
+      return _extStore(a)
     }
 
     function _extStore (val) {
-      let idx
-      if (_deallocdSlots.size > 0) {
-        idx = _deallocdSlots.values().next().value
-        _deallocdSlots.delete(idx)
-      } else {
-        if (_extNextIdx >= EXT_SLOT_MAX) return 0
-        idx = _extNextIdx++
-      }
-      _extMap.set(idx, val)
-      if (val && (typeof val === 'object' || typeof val === 'function')) _registry.register(val, idx)
-      return idx
+      const key = _extFreeKeys.length > 0 ? _extFreeKeys.pop() : _extNextKey++
+      _extMap.set(key, val)
+      _extStoredSinceSweep = true
+      return key
     }
 
-    let _isFlushing = false
-    function _flushPendingMicrotasks() {
-      if (_pendingMicrotasks.length === 0 || _isFlushing) return
-      _isFlushing = true
-      try {
-        _log(PREFIX + ' flushing ' + _pendingMicrotasks.length + ' deferred microtask(s)')
-        while (_pendingMicrotasks.length > 0) {
-          const cb = _pendingMicrotasks.shift()
-          try { cb() } catch (e) { console.log(PREFIX + ' microtask error: ' + e) }
-        }
-      } finally {
-        _isFlushing = false
+    /* Free keys no longer in the table. Only safe at call depth 0. */
+    function _extSweep () {
+      if (!_extStoredSinceSweep || _instHandle === null) return
+      _extStoredSinceSweep = false
+      const live = new Set(binding.tableKeys(_instHandle))
+      for (const key of _extMap.keys()) {
+        if (!live.has(key)) { _extMap.delete(key); _extFreeKeys.push(key) }
       }
     }
 
@@ -179,19 +252,13 @@ class Instance {
         _importCounts[k] = 0
         const _fnBase = fn.replace(WBINDGEN_SUFFIX_RE, '')
         const _isVerbose = _fnBase === '__wbg___wbindgen_is_undefined' ||
-          (_fnBase === '__wbg_queueMicrotask' && _importTotalParams.get(k) === WBINDGEN_QUEUE_MICROTASK_PARAMS) ||
+          _fnBase === '__wbg_queueMicrotask' ||
           _fnBase.startsWith('__wbg_static_accessor_')
         _wrappedImports[mod][fn] = (...args) => {
           const n = ++_importCounts[k]
           if (n === 1 || _traceAllImports) _log(PREFIX + ' import ' + k + ' n=' + n + (_traceAllImports ? ' rawArgs=' + JSON.stringify(args) : ''))
-          if (_isVerbose) _log(PREFIX + ' ' + fn + ' rawArgs=' + JSON.stringify(args) + ' extMap[' + args[0] + ']=' + String(_extMap.get(args[0])) + ' _extNextIdx=' + _extNextIdx)
-          if (_instHandle !== null) {
-            const _mb = binding.getMemory(_instHandle)
-            if (_mb.byteLength !== _prevMemBuf?.byteLength) {
-              _log(PREFIX + ' mem@import grow detected: ' + (_prevMemBuf ? _prevMemBuf.byteLength : 0) + ' -> ' + _mb.byteLength)
-              _prevMemBuf = _mb
-            }
-          }
+          if (_isVerbose) _log(PREFIX + ' ' + fn + ' rawArgs=' + JSON.stringify(args) + ' extMap[' + args[0] + ']=' + String(_extMap.get(args[0])))
+          _checkMemoryGrow('import')
           let resolvedArgs = args
           try {
             const _extrefPositions = _extRefParamInfo.get(k)
@@ -202,84 +269,11 @@ class Instance {
               _log(PREFIX + ' ' + fn + ' n=' + n + ' rawArgs=' + JSON.stringify(args))
             }
             if (_isVerbose) _log(PREFIX + ' ' + fn + ' resolved[0]=' + typeof resolvedArgs[0] + ':' + String(resolvedArgs[0]))
-            if (resolvedArgs[0] === undefined || resolvedArgs[0] === null) {
-              if (_fnBase === '__wbg_queueMicrotask') {
-                const qm = globalThis.queueMicrotask
-                _log(PREFIX + ' queueMicrotask fallback to globalThis, type=' + typeof qm)
-                if (typeof qm === 'function') {
-                  return _extStore(qm)
-                }
-                return 0
-              }
-              if (_fnBase === '__wbg___wbindgen_is_undefined') {
-                return 0
-              }
-            }
-            if (_fnBase === '__wbg_queueMicrotask') {
-              const rawCbIdx = args[args.length - 1]
-              const rawCb = resolvedArgs[resolvedArgs.length - 1]
-              _log(PREFIX + ' queueMicrotask intercept: cbIdx=' + rawCbIdx + ' typeof cb=' + typeof rawCb + ' inCallExport=' + _inCallExport)
-              if (_inCallExport > 0 && typeof rawCb === 'function') {
-                _log(PREFIX + ' queueMicrotask DEFERRED (depth=' + _inCallExport + ')')
-                const deferredCb = (...a) => {
-                  _log(PREFIX + ' deferred microtask fired — enabling trace')
-                  _traceAllImports = true
-                  try { return rawCb(...a) }
-                  finally { _traceAllImports = false; _log(PREFIX + ' deferred microtask done — trace off') }
-                }
-                _pendingMicrotasks.push(deferredCb)
-                return undefined
-              }
-              const wrappedCb = typeof rawCb === 'function'
-                ? (...cbArgs) => {
-                    _log(PREFIX + ' queueMicrotask fired — enabling trace')
-                    _traceAllImports = true
-                    try { return rawCb(...cbArgs) }
-                    finally { _traceAllImports = false; _log(PREFIX + ' queueMicrotask done — trace off') }
-                  }
-                : rawCb
-              _extStore(wrappedCb)
-              const actualResolvedArgs = [...resolvedArgs.slice(0, -1), wrappedCb]
-              let ret = f(...actualResolvedArgs)
-              if (_extRefRetImportKeys.has(k)) {
-                if (ret === null || ret === undefined) return 0
-                if (typeof ret === 'number' && _extMap.has(ret)) return ret
-                return _extStore(ret)
-              }
-              if (typeof ret === 'boolean') return ret ? 1 : 0
-              if (ret !== null && ret !== undefined && (typeof ret === 'object' || typeof ret === 'function' || typeof ret === 'symbol')) {
-                return _extStore(ret)
-              }
-              return ret
-            }
-            if (_fnBase === '__wbg_call' && (_importTotalParams.get(k) >= WBINDGEN_CALL_MIN_PARAMS || args.length >= WBINDGEN_CALL_MIN_PARAMS) && _inCallExport > 0) {
-              const fnVal = resolvedArgs[0]
-              const thisVal = resolvedArgs[1] === undefined ? _extMap.get(WBINDGEN_SLOT_UNDEFINED) : resolvedArgs[1]
-              const callArgs = resolvedArgs.slice(2)
-              const fnDesc = typeof fnVal === 'function' ? (fnVal.name || 'anon-fn') : String(fnVal)
-              _log(PREFIX + ' __wbg_call intercept: fnType=' + typeof fnVal + ' fnName=' + fnDesc + ' nargs=' + resolvedArgs.length + ' depth=' + _inCallExport)
-              if (typeof fnVal === 'function' && typeof fnVal._wbg_cb_unref === 'function') {
-                const deferredCb = () => {
-                  _log(PREFIX + ' deferred __wbg_call firing: ' + fnDesc)
-                  _traceAllImports = true
-                  try { fnVal.call(thisVal, ...callArgs) }
-                  catch (e) { _log(PREFIX + ' deferred __wbg_call threw: ' + e) }
-                  finally {
-                    _traceAllImports = false
-                    if (ioNudge) ioNudge()
-                  }
-                }
-                _pendingMicrotasks.push(deferredCb)
-                _log(PREFIX + ' __wbg_call DEFERRED (depth=' + _inCallExport + ')')
-                return 0
-              }
-            }
             let ret = f(...resolvedArgs)
             if (_isVerbose) _log(PREFIX + ' ' + fn + ' ret=' + typeof ret + ':' + String(ret))
             if (_extRefRetImportKeys.has(k)) {
-              if (ret === null || ret === undefined) return 0
-              if (typeof ret === 'number' && _extMap.has(ret)) return ret
-              return _extStore(ret)
+              /* Externref result: a number here is a value, not a key. */
+              return _toExtref(ret)
             }
             if (typeof ret === 'boolean') return ret ? 1 : 0
             if (ret !== null && ret !== undefined &&
@@ -289,7 +283,7 @@ class Instance {
             return ret
           } catch (e) {
             const _mb2 = _instHandle !== null ? binding.getMemory(_instHandle) : null
-            console.log(PREFIX + ' import ERROR ' + k + ': ' + (e && e.message) + ' rawArgs=' + JSON.stringify(args) + ' resolved=' + JSON.stringify(resolvedArgs.map(a => typeof a === 'object' ? '[obj]' : typeof a === 'function' ? '[fn]' : String(a))) + ' memLen=' + (_mb2 ? _mb2.byteLength : '?') + ' detached=' + (_mb2 ? _mb2.detached : '?'))
+            console.log(PREFIX + ' import ERROR ' + k + ': ' + (e && e.message) + ' rawArgs=' + _safeJson(args) + ' resolved=' + _safeJson(resolvedArgs.map(a => typeof a === 'object' ? '[obj]' : typeof a === 'function' ? '[fn]' : String(a))) + ' memLen=' + (_mb2 ? _mb2.byteLength : '?') + ' detached=' + (_mb2 ? _mb2.detached : '?'))
             throw e
           }
         }
@@ -301,79 +295,130 @@ class Instance {
     _instHandle = result.handle
     _log(PREFIX + ' instanceNew done')
 
+    /* Exports whose first result is externref. */
+    for (const name of Object.keys(result.externrefResultExports || {})) _returnExports.add(name)
+
+    /* Closure shims, matched by suffix so a different crate hash still resolves. */
+    const _closureShims = new Set()
+    const _closureShimsBySuffix = new Map()
+    for (const [suffix, name] of Object.entries(result.closureExports || {})) {
+      _closureShims.add(name)
+      _closureShimsBySuffix.set(suffix, name)
+    }
+    if (_closureShims.size > 0) _log(PREFIX + ' closure shims: ' + _closureShims.size)
+
     const exports = {}
+
+    /* Runs before the sweep so a returned externref still resolves. */
+    function _exportResult (exportName, r) {
+      if (_debug && exportName === '__wbindgen_start') {
+        const summary = Object.entries(_importCounts).filter(([,n]) => n > 0).map(([k,n]) => k + '=' + n).join(', ')
+        _log(PREFIX + ' __wbindgen_start call done; import calls: ' + (summary || '(none)'))
+      }
+      if (typeof r === 'number' && _returnExports.has(exportName)) {
+        const extVal = _resolveExtref(r)
+        _log(PREFIX + ' externref-return: ' + exportName + ' key=' + r + ' resolved=' + typeof extVal)
+        return extVal
+      }
+      if (Array.isArray(r)) {
+        /* Multi-value: only a leading externref is resolved. */
+        const out = Array.from(r)
+        if (_returnExports.has(exportName)) out[0] = _resolveExtref(out[0])
+        return out
+      }
+      return r
+    }
+
+    /* Resolve unknown closure shim names by suffix. */
+    const _resolveClosureShim = (name) => {
+      if (typeof name !== 'string' || !name.includes(WBINDGEN_CLOSURE_PREFIX)) return null
+      return _closureShimsBySuffix.get(name.slice(name.indexOf(WBINDGEN_CLOSURE_PREFIX) + WBINDGEN_CLOSURE_PREFIX.length)) || null
+    }
 
     for (const [name, kind] of Object.entries(result.exportsMap)) {
       if (kind === EXPORT_KIND_FUNCTION) {
         const exportName = name
+        const paramTypes = wasmModule._exportParams ? wasmModule._exportParams.get(exportName) : undefined
         exports[exportName] = (...args) => {
           if (_traceAllImports) _log(PREFIX + ' export ' + exportName + ' start args=' + JSON.stringify(args.map(a => typeof a === 'object' ? '[obj]' : typeof a === 'function' ? '[fn]' : String(a))) + ' depth=' + _inCallExport)
-          if (_inCallExport > 0 && exportName === '__wbindgen_exn_store') {
-            return undefined
-          }
-
           if (exportName === '__wbindgen_start') {
             _log(PREFIX + ' __wbindgen_start call start')
           }
 
-          const hasNonNumber = args.some(a => typeof a !== 'number' && typeof a !== 'bigint')
           let callArgs = args
-          if (hasNonNumber) {
+          if (paramTypes) {
+            /* externref params take any value; numeric ones use ToNumber/ToInt32. */
+            for (let i = 0; i < paramTypes.length; i++) {
+              const a = args[i]
+              const t = paramTypes[i]
+              let v = a
+              if (t === WASM_VT_EXTERNREF) v = _toExtref(a)
+              else if (typeof a !== 'number' && typeof a !== 'bigint' && t !== WASM_VT_I64) v = t === WASM_VT_I32 ? Number(a) | 0 : Number(a)
+              if (v !== a || i >= args.length) {
+                if (callArgs === args) callArgs = args.slice()
+                callArgs[i] = v
+              }
+            }
+          } else if (args.some(a => typeof a !== 'number' && typeof a !== 'bigint')) {
             if (args.some(a => a !== null && a !== undefined && typeof a !== 'number' && typeof a !== 'bigint')) {
               _log(PREFIX + ' invoke args raw: ' + exportName + ' → ' + args.map(a => typeof a === 'function' ? '[fn]' : typeof a === 'object' ? '[obj]' : String(a)).join(', '))
             }
             callArgs = args.map(a => {
               if (typeof a === 'number' || typeof a === 'bigint') return a
-              if (a === null) return 0
-              if (a === undefined) return _extUndefinedSlot
-              const idx = _extStore(a)
+              const idx = _toExtref(a)
               _log(PREFIX + ' externref store: ' + exportName + ' arg → idx=' + idx + ' type=' + typeof a)
               return idx
             })
           }
 
-          if (_instHandle !== null) {
-            const _mb = binding.getMemory(_instHandle)
-            if (_mb.byteLength !== _prevMemBuf?.byteLength) {
-              _log(PREFIX + ' mem@export grow detected: ' + (_prevMemBuf ? _prevMemBuf.byteLength : 0) + ' -> ' + _mb.byteLength)
-              _prevMemBuf = _mb
-            }
-          }
+          _checkMemoryGrow('export')
 
           let r
           _inCallExport++
           try {
-            r = binding.callExport(_instHandle, exportName, callArgs)
+            if (_closureShims.has(exportName)) {
+              r = binding.callExport(_instHandle, exportName, [exportName, ...callArgs], true)
+            } else {
+              r = binding.callExport(_instHandle, exportName, callArgs)
+            }
           } catch (e) {
             _inCallExport--
+            _checkMemoryGrow('export-ret')
             if (_inCallExport === 0) {
-              _flushPendingMicrotasks()
+              _extSweep()
               if (typeof ioNudge === 'function') { _log(PREFIX + ' ioNudge (err)'); ioNudge() }
             }
-            console.log(PREFIX + ' callExport ERROR: ' + exportName + ' => ' + (e && e.message) + ' callArgs=' + JSON.stringify(callArgs))
+            console.log(PREFIX + ' callExport ERROR: ' + exportName + ' => ' + (e && e.message) + ' callArgs=' + _safeJson(callArgs))
             throw e
           }
           _inCallExport--
+          /* Memory may have moved: detach the stale buffer. */
+          _checkMemoryGrow('export-ret')
+          const out = _exportResult(exportName, r)
           if (_inCallExport === 0) {
-            _flushPendingMicrotasks()
+            _extSweep()
             if (typeof ioNudge === 'function') { _log(PREFIX + ' ioNudge'); ioNudge() }
           }
-          if (_debug && exportName === '__wbindgen_start') {
-            const summary = Object.entries(_importCounts).filter(([,n]) => n > 0).map(([k,n]) => k + '=' + n).join(', ')
-            _log(PREFIX + ' __wbindgen_start call done; import calls: ' + (summary || '(none)'))
-          }
-          if (typeof r === 'number' && _returnExports.has(exportName)) {
-            const extVal = _resolveExtref(r)
-            _log(PREFIX + ' externref-return: ' + exportName + ' slot=' + r + ' resolved=' + typeof extVal)
-            return extVal
-          }
-          return r
+          return out
         }
       } else if (kind === EXPORT_KIND_TABLE) {
+        /* The externref table stores keys; JS reads and writes values. */
         exports[name] = {
-          get (idx) { return binding.tableGet(_instHandle, idx) },
-          set (idx, val) { binding.tableSet(_instHandle, idx, val) },
-          grow (n) { return binding.tableGrow(_instHandle, n) },
+          get (idx) {
+            const key = binding.tableGet(_instHandle, idx)
+            if (key === undefined) throw new RangeError('table index out of bounds')
+            return _resolveExtref(key)
+          },
+          set (idx, val) { binding.tableSet(_instHandle, idx, _toExtref(val)) },
+          grow (n, init) {
+            const old = binding.tableGrow(_instHandle, n)
+            /* JS API default for externref is undefined. */
+            const key = _toExtref(init)
+            if (old !== -1 && key !== EXT_KEY_NULL) {
+              for (let i = old; i < old + n; i++) binding.tableSet(_instHandle, i, key)
+            }
+            return old
+          },
           get length () { return binding.tableSize(_instHandle) },
         }
       } else if (kind === EXPORT_KIND_MEMORY) {
@@ -398,37 +443,22 @@ class Instance {
       }
     }
 
-    // ── Externref table polyfill ─────────────────────────────────────────────
-    for (const tblName of ['__wbindgen_externrefs', '__wbindgen_export_2']) {
-      if (tblName in exports && exports[tblName] && typeof exports[tblName].set === 'function') {
-        const orig = exports[tblName]
-        exports[tblName] = {
-          get (idx) { return _resolveExtref(idx) },
-          set (idx, val) { _extMap.set(idx, val) },
-          grow (n) { return orig.grow(n) },
-          get length () { return orig.length },
+    this.closureShims = _closureShimsBySuffix
+    this.exports = new Proxy(exports, {
+      get (target, prop, receiver) {
+        if (typeof prop === 'string' && !(prop in target) && prop.includes(WBINDGEN_CLOSURE_PREFIX)) {
+          const shim = _resolveClosureShim(prop)
+          if (shim) return target[shim]
         }
-        _log(PREFIX + ' externref table polyfill installed for ' + tblName)
-      }
-    }
-
-    // Replace __externref_table_alloc / __externref_table_dealloc with pure-JS
-    exports.__externref_table_alloc = () => {
-      if (_deallocdSlots.size > 0) {
-        const idx = _deallocdSlots.values().next().value
-        _deallocdSlots.delete(idx)
-        return idx
-      }
-      if (_extNextIdx >= EXT_SLOT_MAX) return EXT_GROW_FAIL
-      return _extNextIdx++
-    }
-    exports.__externref_table_dealloc = (idx) => {
-      _extMap.delete(idx)
-      _deallocdSlots.add(idx)
-    }
-    _log(PREFIX + ' __externref_table_alloc/dealloc polyfills installed')
-
-    this.exports = exports
+        return Reflect.get(target, prop, receiver)
+      },
+      has (target, prop) {
+        if (typeof prop === 'string' && !(prop in target) && prop.includes(WBINDGEN_CLOSURE_PREFIX)) {
+          return _resolveClosureShim(prop) !== null
+        }
+        return Reflect.has(target, prop)
+      },
+    })
     this._instHandle = _instHandle
 
     // Diagnostic: check for WASM imports not provided by JS
