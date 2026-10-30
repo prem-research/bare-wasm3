@@ -15,7 +15,7 @@ jobs:
     if: ${{ github.event.head_commit != null && !endsWith(github.event.head_commit.message, '[skip-ci]') }}
 
     steps:
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: app-token
         with:
           app-id: ${{ secrets.GHA_CICD_APPID }}
