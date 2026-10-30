@@ -3,11 +3,18 @@
 # Idempotent — safe to run multiple times.
 # Run after bare-make generate (cmake-fetch re-extracts the source).
 #
+# Usage: sh patch-wasm3.sh [build/<target> ...]   (default: every build/*/)
+#
 set -e
 
 BASE="$(cd "$(dirname "$0")" && pwd)"
 
-for build_dir in build/*/; do
+# Relative to the wasm3 source, so quilt's saved path works on any machine.
+REL_PATCHES="../../../../../patches"
+
+[ "$#" -gt 0 ] || set -- build/*/
+
+for build_dir in "$@"; do
   build_dir="${build_dir%/}"
   src="$BASE/$build_dir/_deps/github+wasm3+wasm3-src/source"
   if [ ! -d "$src" ]; then
@@ -16,8 +23,12 @@ for build_dir in build/*/; do
   fi
 
   echo "  [patch] applying patches to $build_dir ..."
+  # Fix absolute paths saved by older runs.
+  if [ -f "$src/.pc/.quilt_patches" ]; then
+    echo "$REL_PATCHES" > "$src/.pc/.quilt_patches"
+  fi
   rc=0
-  (cd "$src" && QUILT_PATCHES="$BASE/patches" quilt --quiltrc - push -a) || rc=$?
+  (cd "$src" && QUILT_PATCHES="$REL_PATCHES" quilt --quiltrc - push -a) || rc=$?
   # ignore re-applying patches
   [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ] || exit "$rc"
 
